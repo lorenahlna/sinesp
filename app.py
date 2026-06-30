@@ -1,4 +1,4 @@
-# VERSION_FINAL_SEGURANCA_SINESP_OFICIAL_DUCKDB_V12
+# VERSION_FINAL_SEGURANCA_SINESP_OFICIAL_DUCKDB_V14_SEXO_TIPO_CRIME
 # Fonte: MJSP/SINESP - Dados Nacionais de Seguranca Publica
 # Estrutura metodologica:
 # - Municipio: base oficial municipal, indicador Homicidio doloso, unidade Vitimas.
@@ -62,7 +62,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-CACHE_SCHEMA_VERSION = "v12_oficial_20260630"
+CACHE_SCHEMA_VERSION = "v14_sexo_tipo_crime_20260630"
 
 URL_MJSP_MUNICIPIOS = (
     "https://dados.mj.gov.br/dataset/210b9ae2-21fc-4986-89c6-2006eb4db247/"
@@ -196,13 +196,13 @@ def uf_para_sigla(valor):
 
 def padronizar_sexo(valor):
     s = normalizar_texto(valor)
-    if not s:
+    if not s or s in ["NAN", "NONE", "NULL"]:
         return "Nao informado"
     if "FEM" in s:
         return "Feminino"
     if "MASC" in s:
         return "Masculino"
-    if "NI" in s or "NAO" in s or "IGN" in s:
+    if "SEXO NI" in s or s == "NI" or "NAO INFORM" in s or "NAO IDENT" in s or "IGN" in s or "INDETER" in s:
         return "Sexo NI"
     return str(valor).strip().title()
 
@@ -409,7 +409,11 @@ def build_where(tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, u
     if tipo == "municipios" and municipio and municipio != "Todos os municipios":
         clauses.append("MUNICIPIO_FILTRO = ?")
         params.append(chave_filtro(municipio))
-    if crime and crime not in ["Todos os indicadores", "Todos os tipos de crime"]:
+    # Na base MUNICIPAL oficial, o indicador e fixo por metodologia: Homicidio doloso / Vitimas.
+    # Portanto NAO aplicamos filtro por TIPO_CRIME aqui.
+    # Isso evita o bug em que "Homicidio doloso" nao casava exatamente com o valor padronizado
+    # e a consulta so retornava quando o usuario escolhia "Todos os indicadores".
+    if tipo != "municipios" and crime and crime not in ["Todos os indicadores", "Todos os tipos de crime"]:
         clauses.append("TIPO_CRIME_FILTRO = ?")
         params.append(chave_filtro(crime))
     if ano and ano != "Todos os anos":
@@ -418,7 +422,9 @@ def build_where(tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, u
     if mes is not None:
         clauses.append("MES_ORDEM_NUM = ?")
         params.append(int(mes))
-    if unidade:
+    # A base municipal ja e homogenea em Vitimas. O filtro por unidade tambem fica
+    # desabilitado para municipio para evitar zeragem por divergencia de grafia.
+    if tipo != "municipios" and unidade:
         clauses.append("UNIDADE_MEDIDA_FILTRO = ?")
         params.append(chave_filtro(unidade))
     if sexo and sexo != "Todos os sexos":
@@ -506,6 +512,48 @@ def tabela_sexo(df_vitimas):
     tab["PARTICIPACAO_%"] = (tab["VITIMAS"] / total * 100).round(2) if total else 0
     return tab
 
+
+def tabela_vitimas_por_crime(df_vitimas, top=15):
+    if df_vitimas.empty or "TIPO_CRIME" not in df_vitimas.columns:
+        return pd.DataFrame()
+    base = df_vitimas.copy()
+    base["VITIMAS"] = pd.to_numeric(base["VITIMAS"], errors="coerce").fillna(0)
+    tab = base.groupby("TIPO_CRIME", as_index=False)["VITIMAS"].sum()
+    tab = tab[tab["VITIMAS"] > 0].sort_values("VITIMAS", ascending=False).head(top)
+    total = tab["VITIMAS"].sum()
+    tab["PARTICIPACAO_%"] = (tab["VITIMAS"] / total * 100).round(2) if total else 0
+    return tab
+
+
+def tabela_vitimas_crime_sexo(df_vitimas, top_crimes=12):
+    if df_vitimas.empty or not {"TIPO_CRIME", "SEXO_DA_VITIMA", "VITIMAS"}.issubset(df_vitimas.columns):
+        return pd.DataFrame()
+    base = df_vitimas.copy()
+    base["VITIMAS"] = pd.to_numeric(base["VITIMAS"], errors="coerce").fillna(0)
+    base = base[base["VITIMAS"] > 0]
+    if base.empty:
+        return pd.DataFrame()
+    top = (
+        base.groupby("TIPO_CRIME")["VITIMAS"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(top_crimes)
+        .index
+        .tolist()
+    )
+    base = base[base["TIPO_CRIME"].isin(top)]
+    piv = pd.pivot_table(
+        base,
+        index="TIPO_CRIME",
+        columns="SEXO_DA_VITIMA",
+        values="VITIMAS",
+        aggfunc="sum",
+        fill_value=0,
+    ).reset_index()
+    sexo_cols = [c for c in piv.columns if c != "TIPO_CRIME"]
+    piv["TOTAL_VITIMAS"] = piv[sexo_cols].sum(axis=1) if sexo_cols else 0
+    return piv.sort_values("TOTAL_VITIMAS", ascending=False)
+
 # -----------------------------------------------------------------------------
 # SIDEBAR
 # -----------------------------------------------------------------------------
@@ -536,14 +584,15 @@ if tipo == "municipios":
     municipio_sel = st.sidebar.selectbox("Municipio:", ["Todos os municipios"] + municipios)
     st.sidebar.caption("Base municipal oficial: Homicidio doloso em vitimas. Nao ha sexo da vitima nesta base municipal.")
 else:
-    st.sidebar.info("A base por UF e agregada por estado; nao possui recorte municipal.")
+    st.sidebar.info("A base por UF e agregada por estado. Ela traz ocorrencias por tipo de crime e, na aba Vitimas, permite analise por sexo da vitima e tipo de crime.")
 
 if tipo == "municipios":
     metrica_label = "Vitimas"
     metrica_coluna = "VITIMAS"
     unidade = "Vitimas"
     crime_sel = "Homicidio doloso"
-    st.sidebar.selectbox("Indicador/tipo de crime:", ["Homicidio doloso"], disabled=True)
+    st.sidebar.markdown("**Indicador:** Homicidio doloso")
+    st.sidebar.caption("No recorte municipal oficial, o indicador e fixo. O app nao aplica filtro textual de crime nesta base; filtra apenas UF, municipio, ano e mes.")
     sexo_sel = "Todos os sexos"
 else:
     metrica_label = st.sidebar.selectbox("Metrica principal:", ["Ocorrencias", "Vitimas"], index=0)
@@ -577,7 +626,7 @@ if not consultar:
         """
         **Leitura correta da fonte:**
         - **Municipio:** base oficial municipal, com **homicidio doloso** medido em **vitimas**.
-        - **UF:** base oficial estadual, com varios crimes em **ocorrencias** e, na aba de vitimas, perfil por sexo para vitimas.
+        - **UF:** base oficial estadual, com varios crimes em **ocorrencias** e, na aba de vitimas, analise por **sexo da vitima** e **tipo de crime**.
         - **Sexo NI:** sexo nao informado/nao identificado; deve permanecer como categoria propria.
         """
     )
@@ -593,7 +642,9 @@ st.markdown(
 )
 
 if tipo == "municipios":
-    df_main = query_df(path, tipo, uf=uf_sel, municipio=municipio_sel, crime=crime_sel, ano=ano_sel, mes=mes_sel, unidade="Vitimas")
+    # Base municipal: indicador e unidade sao fixos por metodologia.
+    # Consulta sem filtro de crime/unidade para evitar divergencia de grafia/codificacao.
+    df_main = query_df(path, tipo, uf=uf_sel, municipio=municipio_sel, ano=ano_sel, mes=mes_sel)
     df_vitimas = df_main.copy()
 else:
     df_main = query_df(path, tipo, uf=uf_sel, crime=crime_sel, ano=ano_sel, mes=mes_sel, unidade=unidade, sexo=sexo_sel)
@@ -608,6 +659,7 @@ if df_main.empty:
         "uf": uf_sel,
         "municipio": municipio_sel if tipo == "municipios" else None,
         "crime": crime_sel,
+        "observacao_municipal": "No nivel municipal, Homicidio doloso/Vitimas e indicador fixo; o filtro por crime nao e aplicado." if tipo == "municipios" else None,
         "ano": ano_sel,
         "mes": mes_nome,
         "unidade": unidade,
@@ -646,20 +698,33 @@ st.caption("Motor de filtro: DuckDB sobre Parquet local em cache. A primeira car
 st.caption("Fonte: MJSP/SINESP - Dados Nacionais de Seguranca Publica.")
 st.markdown("---")
 
-# Perfil por sexo para UF / vitimas.
+# Analises complementares de vitimas para UF.
 sexo_tab = tabela_sexo(df_vitimas) if tipo == "uf" else pd.DataFrame()
-if tipo == "uf" and not sexo_tab.empty:
-    st.subheader("Perfil das vitimas por sexo")
-    sdict = dict(zip(sexo_tab["SEXO_DA_VITIMA"], sexo_tab["VITIMAS"]))
-    s1, s2, s3, s4 = st.columns(4)
-    with s1:
-        metric_card("👥 Total vitimas", fmt_int(sexo_tab["VITIMAS"].sum()), "Aba Vitimas", "#0b2239")
-    with s2:
-        metric_card("♂ Masculino", fmt_int(sdict.get("Masculino", 0)), "Vitimas masculinas", "#1c2d42")
-    with s3:
-        metric_card("♀ Feminino", fmt_int(sdict.get("Feminino", 0)), "Vitimas femininas", "#d9534f")
-    with s4:
-        metric_card("NI", fmt_int(sdict.get("Sexo NI", 0)), "Sexo nao informado", "#f0ad4e")
+vitimas_crime_tab = tabela_vitimas_por_crime(df_vitimas, top=15) if tipo == "uf" else pd.DataFrame()
+crime_sexo_tab = tabela_vitimas_crime_sexo(df_vitimas, top_crimes=12) if tipo == "uf" else pd.DataFrame()
+
+if tipo == "uf":
+    st.subheader("Analise complementar das vitimas")
+    if sexo_tab.empty and vitimas_crime_tab.empty:
+        st.warning(
+            "A aba de Vitimas nao retornou recorte complementar para estes filtros. "
+            "Verifique se o ano, mes e indicador possuem vitimas informadas na fonte."
+        )
+    else:
+        sdict = dict(zip(sexo_tab.get("SEXO_DA_VITIMA", []), sexo_tab.get("VITIMAS", []))) if not sexo_tab.empty else {}
+        crime_top = vitimas_crime_tab.iloc[0]["TIPO_CRIME"] if not vitimas_crime_tab.empty else "Nao informado"
+        crime_top_v = vitimas_crime_tab.iloc[0]["VITIMAS"] if not vitimas_crime_tab.empty else 0
+        s1, s2, s3, s4, s5 = st.columns(5)
+        with s1:
+            metric_card("👥 Total vitimas", fmt_int(total_vitimas_contexto), "Aba Vitimas", "#0b2239")
+        with s2:
+            metric_card("♂ Masculino", fmt_int(sdict.get("Masculino", 0)), "Vitimas masculinas", "#1c2d42")
+        with s3:
+            metric_card("♀ Feminino", fmt_int(sdict.get("Feminino", 0)), "Vitimas femininas", "#d9534f")
+        with s4:
+            metric_card("NI", fmt_int(sdict.get("Sexo NI", 0)), "Sexo nao informado", "#f0ad4e")
+        with s5:
+            metric_card("🔎 Crime com mais vitimas", crime_top, f"{fmt_int(crime_top_v)} vitimas", "#1c2d42")
 
 # Abas
 aba_painel, aba_dados, aba_diag, aba_export = st.tabs(["📊 Painel Estatistico", "📋 Dados Tratados", "⚙️ Diagnostico", "📥 Exportacao"])
@@ -692,14 +757,34 @@ with aba_painel:
             else:
                 st.info("Ranking municipal fica oculto quando um municipio especifico esta selecionado.")
 
-    if tipo == "uf" and not sexo_tab.empty:
+    if tipo == "uf":
+        st.markdown("---")
+        st.write("### Analise das vitimas")
         csexo1, csexo2 = st.columns(2)
         with csexo1:
-            st.write("**Distribuicao das vitimas por sexo**")
-            st.bar_chart(sexo_tab.set_index("SEXO_DA_VITIMA")["VITIMAS"])
+            st.write("**Vitimas por sexo**")
+            if sexo_tab.empty:
+                st.info("Sem recorte por sexo para os filtros selecionados.")
+            else:
+                st.bar_chart(sexo_tab.set_index("SEXO_DA_VITIMA")["VITIMAS"])
         with csexo2:
-            st.write("**Tabela por sexo da vitima**")
-            st.dataframe(sexo_tab, width="stretch", hide_index=True)
+            st.write("**Vitimas por tipo de crime**")
+            if vitimas_crime_tab.empty:
+                st.info("Sem vitimas por tipo de crime para os filtros selecionados.")
+            else:
+                st.bar_chart(vitimas_crime_tab.set_index("TIPO_CRIME")["VITIMAS"])
+
+        with st.expander("Tabela detalhada: vitimas por sexo e tipo de crime", expanded=True):
+            if crime_sexo_tab.empty:
+                st.info("A fonte nao retornou tabela cruzada de sexo por tipo de crime para este filtro.")
+            else:
+                st.dataframe(crime_sexo_tab, width="stretch", hide_index=True)
+
+        with st.expander("Resumo de vitimas por sexo", expanded=False):
+            if sexo_tab.empty:
+                st.info("Sem resumo por sexo para os filtros selecionados.")
+            else:
+                st.dataframe(sexo_tab, width="stretch", hide_index=True)
     elif tipo == "municipios":
         st.info("A base municipal oficial nao traz sexo da vitima. O perfil por sexo esta disponivel apenas na base agregada por UF.")
 
@@ -709,7 +794,12 @@ with aba_dados:
         "OCORRENCIAS", "VITIMAS", "CODIGO_MUNICIPIO", "FONTE_PROCESSADA",
     ]
     cols = [c for c in cols if c in df_main.columns]
+    st.write("**Dados da metrica principal selecionada**")
     st.dataframe(df_main[cols], width="stretch", hide_index=True)
+    if tipo == "uf" and not df_vitimas.empty:
+        st.write("**Dados complementares da aba Vitimas usados para sexo e tipo de crime**")
+        cols_v = [c for c in cols if c in df_vitimas.columns]
+        st.dataframe(df_vitimas[cols_v], width="stretch", hide_index=True)
 
 with aba_diag:
     st.write("**Resumo da consulta**")
@@ -718,11 +808,16 @@ with aba_diag:
         "uf": uf_sel,
         "municipio": municipio_sel if tipo == "municipios" else None,
         "crime": crime_sel,
+        "observacao_municipal": "No nivel municipal, Homicidio doloso/Vitimas e indicador fixo; o filtro por crime nao e aplicado." if tipo == "municipios" else None,
         "ano": ano_sel,
         "mes": mes_nome,
         "metrica": metrica_label,
         "linhas_retornadas": linhas,
         "total_principal": float(total_principal),
+        "total_vitimas_contexto": float(total_vitimas_contexto),
+        "linhas_aba_vitimas": int(len(df_vitimas)) if tipo == "uf" else None,
+        "sexo_vitima_disponivel": (not sexo_tab.empty) if tipo == "uf" else None,
+        "vitimas_por_tipo_crime_disponivel": (not vitimas_crime_tab.empty) if tipo == "uf" else None,
         "cache": meta,
     })
     st.write("**Amostra do parquet filtrado**")
@@ -741,5 +836,19 @@ with aba_export:
             "📥 Baixar resumo por sexo CSV",
             data=sexo_tab.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig"),
             file_name=f"sinesp_resumo_sexo_{uf_sel}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+        )
+    if tipo == "uf" and not vitimas_crime_tab.empty:
+        st.download_button(
+            "📥 Baixar vitimas por tipo de crime CSV",
+            data=vitimas_crime_tab.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig"),
+            file_name=f"sinesp_vitimas_crime_{uf_sel}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+        )
+    if tipo == "uf" and not crime_sexo_tab.empty:
+        st.download_button(
+            "📥 Baixar tabela crime x sexo CSV",
+            data=crime_sexo_tab.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig"),
+            file_name=f"sinesp_crime_sexo_{uf_sel}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
