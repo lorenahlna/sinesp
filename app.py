@@ -1,9 +1,9 @@
-# VERSION_FINAL_SEGURANCA_SINESP_OFICIAL_DUCKDB_V15
-# Fonte: MJSP/SINESP - Dados Nacionais de Seguranca Publica
-# Regras metodologicas do app:
-# 1) MUNICIPIO: base oficial municipal = Homicidio doloso / Vitimas. Nao existe painel municipal completo por tipo de crime.
-# 2) UF: base oficial por UF = Ocorrencias por varios crimes + Vitimas por sexo e tipo de crime.
-# 3) A analise de vitimas no painel UF usa sempre a estrutura de Vitimas, filtrada por UF/ano/mes/crime, sem depender da metrica principal.
+# VERSION_FINAL_SEGURANCA_SINESP_OFICIAL_DUCKDB_V16_ROBUSTO
+# Fonte unica: MJSP/SINESP - Dados Nacionais de Seguranca Publica
+# Regras metodologicas:
+# 1) MUNICIPIO: base oficial municipal = Homicidio doloso / Vitimas.
+# 2) UF: base oficial estadual = Ocorrencias por varios crimes + Vitimas por sexo/tipo de crime.
+# 3) A analise de sexo sempre usa a estrutura estadual de VITIMAS, independentemente da metrica principal selecionada.
 
 import io
 import os
@@ -20,9 +20,6 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# -----------------------------------------------------------------------------
-# CONFIGURACAO DA PAGINA
-# -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="Inteligencia Territorial | Seguranca Publica",
     page_icon="🛡️",
@@ -50,11 +47,18 @@ st.markdown(
         box-shadow: 2px 2px 5px rgba(0,0,0,0.05);
         min-height: 145px;
     }
-    .metric-card h4 { margin-top: 0; color: #0b2239; }
-    .metric-card h2 { margin: 0; }
+    .metric-card h4 { margin-top: 0; color: #0b2239; font-size: 0.95rem; }
+    .metric-card h2 { margin: 0; font-size: 1.55rem; }
     .method-box {
         background-color: #eef3f8;
         border-left: 5px solid #1c2d42;
+        padding: 12px;
+        border-radius: 6px;
+        margin-bottom: 10px;
+    }
+    .warning-box {
+        background-color: #fff8e8;
+        border-left: 5px solid #f0ad4e;
         padding: 12px;
         border-radius: 6px;
         margin-bottom: 10px;
@@ -64,7 +68,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-CACHE_SCHEMA_VERSION = "v15_oficial_limpo_20260630"
+CACHE_SCHEMA_VERSION = "v16_robusto_20260630"
 
 URL_MJSP_MUNICIPIOS = (
     "https://dados.mj.gov.br/dataset/210b9ae2-21fc-4986-89c6-2006eb4db247/"
@@ -129,13 +133,11 @@ def normalizar_texto(texto):
 
 
 def chave_filtro(texto):
-    texto = normalizar_texto(texto)
-    return re.sub(r"[^A-Z0-9]+", "", texto)
+    return re.sub(r"[^A-Z0-9]+", "", normalizar_texto(texto))
 
 
 def normalizar_coluna(coluna):
-    col = normalizar_texto(coluna)
-    col = col.replace(".", "")
+    col = normalizar_texto(coluna).replace(".", "")
     col = re.sub(r"[^A-Z0-9]+", "_", col)
     return col.strip("_")
 
@@ -146,12 +148,11 @@ def converter_numero(valor):
     s = str(valor).strip()
     if not s:
         return 0.0
-    # Aceita formato brasileiro e formato simples.
     if re.search(r"\d+[,]\d+$", s):
         s = s.replace(".", "").replace(",", ".")
     else:
         s = s.replace(",", "")
-    return pd.to_numeric(s, errors="coerce")
+    return float(pd.to_numeric(s, errors="coerce") or 0)
 
 
 def parse_data_mes_ano(valor):
@@ -176,12 +177,6 @@ def parse_data_mes_ano(valor):
     return pd.to_datetime(s, errors="coerce", dayfirst=False)
 
 
-def padronizar_municipio(valor):
-    if pd.isna(valor):
-        return ""
-    return str(valor).strip().title()
-
-
 def uf_para_sigla(valor):
     if pd.isna(valor):
         return ""
@@ -189,6 +184,12 @@ def uf_para_sigla(valor):
     if v in UFS:
         return v
     return NOME_UF_NORMALIZADO.get(v, "")
+
+
+def padronizar_municipio(valor):
+    if pd.isna(valor):
+        return ""
+    return str(valor).strip().title()
 
 
 def padronizar_sexo(valor):
@@ -203,11 +204,20 @@ def padronizar_sexo(valor):
         return "Sexo NI"
     return str(valor).strip().title()
 
+
+def localizar_coluna(df, candidatos):
+    mapa = {normalizar_coluna(c): c for c in df.columns}
+    for cand in candidatos:
+        c = normalizar_coluna(cand)
+        if c in mapa:
+            return mapa[c]
+    return None
+
 # -----------------------------------------------------------------------------
-# CACHE / LEITURA DOS XLSX
+# CACHE / DOWNLOAD
 # -----------------------------------------------------------------------------
 def pasta_cache():
-    path = os.path.join(tempfile.gettempdir(), "sinesp_mjsp_v15_cache")
+    path = os.path.join(tempfile.gettempdir(), "sinesp_mjsp_v16_cache")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -217,34 +227,41 @@ def caminho_parquet(tipo):
 
 
 def baixar_xlsx(url, nome_local):
-    # Em desenvolvimento local ou no sandbox, usa o arquivo se ele existir ao lado do app.
     if os.path.exists(nome_local):
         with open(nome_local, "rb") as f:
             return f.read(), f"arquivo local: {nome_local}"
-    resp = requests.get(url, timeout=180, verify=False, headers={"User-Agent": "Mozilla/5.0"})
+    resp = requests.get(url, timeout=240, verify=False, headers={"User-Agent": "Mozilla/5.0"})
     resp.raise_for_status()
     return resp.content, url
 
 
 def adicionar_colunas_filtro(df):
     df = df.copy()
+    colunas_base = [
+        "CODIGO_MUNICIPIO", "MUNICIPIO", "UF", "REGIAO", "ANO", "MES_ORDEM", "MES_NOME", "MES_ANO",
+        "TIPO_CRIME", "UNIDADE_MEDIDA", "SEXO_DA_VITIMA", "OCORRENCIAS", "VITIMAS", "NIVEL_BASE",
+        "METRICA_FONTE", "ABA_ORIGEM", "FONTE_PROCESSADA",
+    ]
+    for c in colunas_base:
+        if c not in df.columns:
+            df[c] = ""
+
+    df["UF"] = df["UF"].map(uf_para_sigla)
     df["UF_FILTRO"] = df["UF"].astype(str).str.upper().str.strip()
     df["MUNICIPIO_FILTRO"] = df["MUNICIPIO"].map(chave_filtro)
     df["TIPO_CRIME_FILTRO"] = df["TIPO_CRIME"].map(chave_filtro)
     df["UNIDADE_MEDIDA_FILTRO"] = df["UNIDADE_MEDIDA"].map(chave_filtro)
     df["SEXO_DA_VITIMA_FILTRO"] = df["SEXO_DA_VITIMA"].map(chave_filtro)
-    df["ANO_FILTRO"] = df["ANO"].astype(str).str.strip()
+    df["METRICA_FONTE_FILTRO"] = df["METRICA_FONTE"].map(chave_filtro)
+    df["ANO_FILTRO"] = df["ANO"].astype(str).str.extract(r"(\d{4})", expand=False).fillna("")
     df["MES_ORDEM_NUM"] = pd.to_numeric(df["MES_ORDEM"], errors="coerce")
+    df["OCORRENCIAS"] = pd.to_numeric(df["OCORRENCIAS"], errors="coerce").fillna(0).astype(float)
+    df["VITIMAS"] = pd.to_numeric(df["VITIMAS"], errors="coerce").fillna(0).astype(float)
 
-    colunas = [
-        "CODIGO_MUNICIPIO", "MUNICIPIO", "UF", "REGIAO", "ANO", "MES_ORDEM", "MES_NOME", "MES_ANO",
-        "TIPO_CRIME", "UNIDADE_MEDIDA", "SEXO_DA_VITIMA", "OCORRENCIAS", "VITIMAS", "NIVEL_BASE", "ABA_ORIGEM",
-        "FONTE_PROCESSADA", "UF_FILTRO", "MUNICIPIO_FILTRO", "TIPO_CRIME_FILTRO", "UNIDADE_MEDIDA_FILTRO",
-        "SEXO_DA_VITIMA_FILTRO", "ANO_FILTRO", "MES_ORDEM_NUM",
+    colunas = colunas_base + [
+        "UF_FILTRO", "MUNICIPIO_FILTRO", "TIPO_CRIME_FILTRO", "UNIDADE_MEDIDA_FILTRO",
+        "SEXO_DA_VITIMA_FILTRO", "METRICA_FONTE_FILTRO", "ANO_FILTRO", "MES_ORDEM_NUM",
     ]
-    for c in colunas:
-        if c not in df.columns:
-            df[c] = ""
     return df[colunas]
 
 
@@ -252,44 +269,51 @@ def preparar_base_municipal(conteudo):
     xls = pd.ExcelFile(io.BytesIO(conteudo), engine="openpyxl")
     frames = []
     for aba in xls.sheet_names:
-        if normalizar_texto(aba) not in UFS:
+        df_raw = pd.read_excel(io.BytesIO(conteudo), sheet_name=aba, dtype=str, engine="openpyxl")
+        df_raw = df_raw.dropna(how="all")
+        if df_raw.empty:
             continue
-        df = pd.read_excel(io.BytesIO(conteudo), sheet_name=aba, dtype=str, engine="openpyxl")
-        df = df.dropna(how="all")
-        df.columns = [normalizar_coluna(c) for c in df.columns]
+        df_raw.columns = [normalizar_coluna(c) for c in df_raw.columns]
 
-        renomear = {
-            "COD_IBGE": "CODIGO_MUNICIPIO",
-            "CODIGO_IBGE": "CODIGO_MUNICIPIO",
-            "MUNICIPIO": "MUNICIPIO",
-            "SIGLA_UF": "UF",
-            "UF": "UF",
-            "REGIAO": "REGIAO",
-            "MES_ANO": "MES_ANO",
-            "VITIMAS": "VITIMAS",
-        }
-        df = df.rename(columns={c: renomear[c] for c in df.columns if c in renomear})
-        if not {"MUNICIPIO", "UF", "MES_ANO", "VITIMAS"}.issubset(df.columns):
+        col_mun = localizar_coluna(df_raw, ["MUNICIPIO", "MUNICÍPIO", "NOME_MUNICIPIO"])
+        col_uf = localizar_coluna(df_raw, ["UF", "SIGLA_UF", "ESTADO"])
+        col_data = localizar_coluna(df_raw, ["MES_ANO", "MES/ANO", "MESANO", "PERIODO"])
+        col_vit = localizar_coluna(df_raw, ["VITIMAS", "VÍTIMAS", "VALOR"])
+        col_cod = localizar_coluna(df_raw, ["COD_IBGE", "CODIGO_IBGE", "CODIGO_MUNICIPIO", "COD MUNICIPIO"])
+        col_reg = localizar_coluna(df_raw, ["REGIAO", "REGIÃO"])
+
+        if not col_mun or not col_vit:
+            continue
+        if not col_uf and normalizar_texto(aba) not in UFS:
             continue
 
-        df["UF"] = df["UF"].map(uf_para_sigla)
-        df["MUNICIPIO"] = df["MUNICIPIO"].map(padronizar_municipio)
-        dt = df["MES_ANO"].map(parse_data_mes_ano)
-        df["ANO"] = dt.dt.year.astype("Int64").astype(str).replace("<NA>", "Nao informado")
-        df["MES_ORDEM"] = dt.dt.month.astype("Int64")
+        df = pd.DataFrame()
+        df["MUNICIPIO"] = df_raw[col_mun].map(padronizar_municipio)
+        df["UF"] = df_raw[col_uf].map(uf_para_sigla) if col_uf else normalizar_texto(aba)
+        df["CODIGO_MUNICIPIO"] = df_raw[col_cod].astype(str).str.strip() if col_cod else ""
+        df["REGIAO"] = df_raw[col_reg].astype(str).str.strip() if col_reg else ""
+        df["MES_ANO"] = df_raw[col_data].astype(str).str.strip() if col_data else ""
+        df["VITIMAS"] = df_raw[col_vit].map(converter_numero).fillna(0).astype(float)
+
+        if col_data:
+            dt = df["MES_ANO"].map(parse_data_mes_ano)
+            df["ANO"] = dt.dt.year.astype("Int64").astype(str).replace("<NA>", "")
+            df["MES_ORDEM"] = dt.dt.month.astype("Int64")
+        else:
+            col_ano = localizar_coluna(df_raw, ["ANO"])
+            col_mes = localizar_coluna(df_raw, ["MES"])
+            df["ANO"] = df_raw[col_ano].astype(str).str.extract(r"(\d{4})", expand=False).fillna("") if col_ano else ""
+            df["MES_ORDEM"] = df_raw[col_mes].map(lambda x: MES_ORDEM.get(normalizar_texto(x), pd.NA)) if col_mes else pd.NA
+
         df["MES_NOME"] = df["MES_ORDEM"].map(lambda x: MES_LABEL.get(int(x), "Nao informado") if pd.notna(x) else "Nao informado")
         df["TIPO_CRIME"] = "Homicidio doloso"
         df["UNIDADE_MEDIDA"] = "Vitimas"
         df["SEXO_DA_VITIMA"] = "Nao informado na base municipal"
         df["OCORRENCIAS"] = 0.0
-        df["VITIMAS"] = df["VITIMAS"].map(converter_numero).fillna(0).astype(float)
-        df["ABA_ORIGEM"] = "MUNICIPIOS"
         df["NIVEL_BASE"] = "municipio"
+        df["METRICA_FONTE"] = "VITIMAS"
+        df["ABA_ORIGEM"] = "MUNICIPIOS"
         df["FONTE_PROCESSADA"] = "MJSP/SINESP - Municipios XLSX"
-        if "CODIGO_MUNICIPIO" not in df.columns:
-            df["CODIGO_MUNICIPIO"] = ""
-        if "REGIAO" not in df.columns:
-            df["REGIAO"] = ""
         frames.append(df)
 
     if not frames:
@@ -297,62 +321,69 @@ def preparar_base_municipal(conteudo):
     return adicionar_colunas_filtro(pd.concat(frames, ignore_index=True, sort=False))
 
 
+def inferir_tipo_aba(nome_aba, df_raw):
+    aba_norm = normalizar_texto(nome_aba)
+    cols_norm = {normalizar_coluna(c) for c in df_raw.columns}
+    if "VIT" in aba_norm or "VITIMAS" in cols_norm or "SEXO_DA_VITIMA" in cols_norm or "SEXO_VITIMA" in cols_norm:
+        return "VITIMAS"
+    if "OCOR" in aba_norm or "OCORRENCIAS" in cols_norm:
+        return "OCORRENCIAS"
+    return ""
+
+
 def preparar_base_uf(conteudo):
     xls = pd.ExcelFile(io.BytesIO(conteudo), engine="openpyxl")
     frames = []
     for aba in xls.sheet_names:
-        aba_norm = normalizar_texto(aba)
-        if "OCOR" in aba_norm:
+        df_raw = pd.read_excel(io.BytesIO(conteudo), sheet_name=aba, dtype=str, engine="openpyxl")
+        df_raw = df_raw.dropna(how="all")
+        if df_raw.empty:
+            continue
+        df_raw.columns = [normalizar_coluna(c) for c in df_raw.columns]
+        tipo_aba = inferir_tipo_aba(aba, df_raw)
+        if tipo_aba not in ["OCORRENCIAS", "VITIMAS"]:
+            continue
+
+        col_uf = localizar_coluna(df_raw, ["UF", "SIGLA_UF", "ESTADO"])
+        col_crime = localizar_coluna(df_raw, ["TIPO_CRIME", "TIPO_DE_CRIME", "CRIME", "INDICADOR"])
+        col_ano = localizar_coluna(df_raw, ["ANO"])
+        col_mes = localizar_coluna(df_raw, ["MES"])
+        col_sexo = localizar_coluna(df_raw, ["SEXO_DA_VITIMA", "SEXO_VITIMA", "SEXO"])
+        if tipo_aba == "OCORRENCIAS":
+            col_valor = localizar_coluna(df_raw, ["OCORRENCIAS", "OCORRÊNCIAS", "VALOR"])
+            metrica = "OCORRENCIAS"
             unidade = "Ocorrencias"
-            aba_origem = "OCORRENCIAS"
-            valor_destino = "OCORRENCIAS"
-        elif "VIT" in aba_norm:
-            unidade = "Vitimas"
-            aba_origem = "VITIMAS"
-            valor_destino = "VITIMAS"
         else:
+            col_valor = localizar_coluna(df_raw, ["VITIMAS", "VÍTIMAS", "VALOR"])
+            metrica = "VITIMAS"
+            unidade = "Vitimas"
+
+        if not all([col_uf, col_crime, col_ano, col_mes, col_valor]):
             continue
 
-        df = pd.read_excel(io.BytesIO(conteudo), sheet_name=aba, dtype=str, engine="openpyxl")
-        df = df.dropna(how="all")
-        df.columns = [normalizar_coluna(c) for c in df.columns]
-        renomear = {
-            "UF": "UF",
-            "TIPO_CRIME": "TIPO_CRIME",
-            "TIPO_DE_CRIME": "TIPO_CRIME",
-            "CRIME": "TIPO_CRIME",
-            "ANO": "ANO",
-            "MES": "MES",
-            "OCORRENCIAS": "VALOR",
-            "VITIMAS": "VALOR",
-            "SEXO_DA_VITIMA": "SEXO_DA_VITIMA",
-            "SEXO_VITIMA": "SEXO_DA_VITIMA",
-            "SEXO": "SEXO_DA_VITIMA",
-        }
-        df = df.rename(columns={c: renomear[c] for c in df.columns if c in renomear})
-        if not {"UF", "TIPO_CRIME", "ANO", "MES", "VALOR"}.issubset(df.columns):
-            continue
-
-        df["UF"] = df["UF"].map(uf_para_sigla)
+        df = pd.DataFrame()
+        df["UF"] = df_raw[col_uf].map(uf_para_sigla)
+        df["TIPO_CRIME"] = df_raw[col_crime].astype(str).str.strip().replace({"": "Nao informado"})
+        df["ANO"] = df_raw[col_ano].astype(str).str.extract(r"(\d{4})", expand=False).fillna("")
+        df["MES_ORDEM"] = df_raw[col_mes].map(lambda x: MES_ORDEM.get(normalizar_texto(x), pd.NA))
+        df["MES_NOME"] = df["MES_ORDEM"].map(lambda x: MES_LABEL.get(int(x), "Nao informado") if pd.notna(x) else "Nao informado")
+        df["MES_ANO"] = ""
         df["MUNICIPIO"] = ""
         df["CODIGO_MUNICIPIO"] = ""
         df["REGIAO"] = ""
-        df["MES_ANO"] = ""
-        df["ANO"] = df["ANO"].astype(str).str.extract(r"(\d{4})", expand=False).fillna("Nao informado")
-        df["MES_ORDEM"] = df["MES"].map(lambda x: MES_ORDEM.get(normalizar_texto(x), pd.NA))
-        df["MES_NOME"] = df["MES_ORDEM"].map(lambda x: MES_LABEL.get(int(x), "Nao informado") if pd.notna(x) else "Nao informado")
-        df["TIPO_CRIME"] = df["TIPO_CRIME"].astype(str).str.strip().replace({"": "Nao informado"})
-        df["UNIDADE_MEDIDA"] = unidade
-        df["OCORRENCIAS"] = 0.0
-        df["VITIMAS"] = 0.0
-        valores = df["VALOR"].map(converter_numero).fillna(0).astype(float)
-        df[valor_destino] = valores
-        if "SEXO_DA_VITIMA" in df.columns:
-            df["SEXO_DA_VITIMA"] = df["SEXO_DA_VITIMA"].map(padronizar_sexo)
-        else:
+        valores = df_raw[col_valor].map(converter_numero).fillna(0).astype(float)
+        if metrica == "OCORRENCIAS":
+            df["OCORRENCIAS"] = valores
+            df["VITIMAS"] = 0.0
             df["SEXO_DA_VITIMA"] = "Nao se aplica"
-        df["ABA_ORIGEM"] = aba_origem
+        else:
+            df["OCORRENCIAS"] = 0.0
+            df["VITIMAS"] = valores
+            df["SEXO_DA_VITIMA"] = df_raw[col_sexo].map(padronizar_sexo) if col_sexo else "Nao informado"
+        df["UNIDADE_MEDIDA"] = unidade
         df["NIVEL_BASE"] = "uf"
+        df["METRICA_FONTE"] = metrica
+        df["ABA_ORIGEM"] = metrica
         df["FONTE_PROCESSADA"] = "MJSP/SINESP - UF XLSX"
         frames.append(df)
 
@@ -366,35 +397,35 @@ def preparar_parquet(tipo):
     parquet_path = caminho_parquet(tipo)
     try:
         if os.path.exists(parquet_path):
-            return {"ok": True, "parquet_path": parquet_path, "cache": True, "tipo": tipo}
-
+            return {"ok": True, "parquet_path": parquet_path, "cache": True, "tipo": tipo, "schema": CACHE_SCHEMA_VERSION}
         if tipo == "municipios":
             conteudo, origem = baixar_xlsx(URL_MJSP_MUNICIPIOS, "indicadoressegurancapublicamunic.xlsx")
             df = preparar_base_municipal(conteudo)
         else:
             conteudo, origem = baixar_xlsx(URL_MJSP_UF, "indicadoressegurancapublicauf.xlsx")
             df = preparar_base_uf(conteudo)
-
         if df.empty:
             return {"ok": False, "erro": "A base foi lida, mas nenhum registro valido foi identificado.", "tipo": tipo}
-
         df.to_parquet(parquet_path, index=False)
         return {
             "ok": True,
             "parquet_path": parquet_path,
             "cache": False,
             "tipo": tipo,
+            "schema": CACHE_SCHEMA_VERSION,
             "origem": origem,
             "linhas": int(len(df)),
             "colunas": df.columns.tolist(),
+            "anos": sorted(df["ANO_FILTRO"].dropna().unique().tolist()),
+            "metricas": sorted(df["METRICA_FONTE"].dropna().unique().tolist()),
         }
     except Exception as e:
-        return {"ok": False, "erro": str(e), "tipo": tipo}
+        return {"ok": False, "erro": str(e), "tipo": tipo, "schema": CACHE_SCHEMA_VERSION}
 
 # -----------------------------------------------------------------------------
 # DUCKDB
 # -----------------------------------------------------------------------------
-def build_where(tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, unidade=None, sexo=None):
+def build_where(tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, metrica=None, sexo=None):
     clauses = []
     params = []
     if uf:
@@ -412,9 +443,9 @@ def build_where(tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, u
     if mes is not None:
         clauses.append("MES_ORDEM_NUM = ?")
         params.append(int(mes))
-    if tipo != "municipios" and unidade:
-        clauses.append("UNIDADE_MEDIDA_FILTRO = ?")
-        params.append(chave_filtro(unidade))
+    if tipo != "municipios" and metrica:
+        clauses.append("METRICA_FONTE_FILTRO = ?")
+        params.append(chave_filtro(metrica))
     if tipo != "municipios" and sexo and sexo != "Todos os sexos":
         clauses.append("SEXO_DA_VITIMA_FILTRO = ?")
         params.append(chave_filtro(sexo))
@@ -422,15 +453,21 @@ def build_where(tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, u
     return where, params
 
 
-def query_df(path, tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, unidade=None, sexo=None, limit=None):
-    where, params = build_where(tipo, uf, municipio, crime, ano, mes, unidade, sexo)
+def query_df(path, tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, metrica=None, sexo=None, only_positive=False, limit=None):
+    where, params = build_where(tipo, uf, municipio, crime, ano, mes, metrica, sexo)
+    extra = ""
+    if only_positive:
+        if metrica == "VITIMAS" or tipo == "municipios":
+            extra = " AND VITIMAS > 0" if where else " WHERE VITIMAS > 0"
+        elif metrica == "OCORRENCIAS":
+            extra = " AND OCORRENCIAS > 0" if where else " WHERE OCORRENCIAS > 0"
     lim = f" LIMIT {int(limit)}" if limit else ""
-    sql = f"SELECT * FROM read_parquet(?) {where}{lim}"
+    sql = f"SELECT * FROM read_parquet(?) {where}{extra}{lim}"
     return duckdb.execute(sql, [path] + params).df()
 
 
-def distinct_values(path, coluna, tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, unidade=None, sexo=None):
-    where, params = build_where(tipo, uf, municipio, crime, ano, mes, unidade, sexo)
+def distinct_values(path, coluna, tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, metrica=None, sexo=None):
+    where, params = build_where(tipo, uf, municipio, crime, ano, mes, metrica, sexo)
     sql = f"SELECT DISTINCT {coluna} AS valor FROM read_parquet(?) {where} ORDER BY valor"
     try:
         df = duckdb.execute(sql, [path] + params).df()
@@ -439,8 +476,8 @@ def distinct_values(path, coluna, tipo, uf=None, municipio=None, crime=None, ano
         return []
 
 
-def count_rows(path, tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, unidade=None, sexo=None):
-    where, params = build_where(tipo, uf, municipio, crime, ano, mes, unidade, sexo)
+def count_rows(path, tipo, uf=None, municipio=None, crime=None, ano=None, mes=None, metrica=None, sexo=None):
+    where, params = build_where(tipo, uf, municipio, crime, ano, mes, metrica, sexo)
     sql = f"SELECT COUNT(*) AS n FROM read_parquet(?) {where}"
     return int(duckdb.execute(sql, [path] + params).df()["n"].iloc[0])
 
@@ -452,6 +489,13 @@ def fmt_int(valor):
         return f"{int(round(float(valor))):,}".replace(",", ".")
     except Exception:
         return "0"
+
+
+def fmt_pct(valor):
+    try:
+        return f"{float(valor):.1f}%".replace(".", ",")
+    except Exception:
+        return "0,0%"
 
 
 def metric_card(titulo, valor, subtitulo, cor="#1c2d42"):
@@ -492,7 +536,7 @@ def resumo_sexo(df_vitimas):
     base = df_vitimas.copy()
     base["VITIMAS"] = pd.to_numeric(base["VITIMAS"], errors="coerce").fillna(0)
     base = base[base["VITIMAS"] > 0]
-    base = base[base["SEXO_DA_VITIMA"].astype(str).str.strip().ne("")]
+    base = base[~base["SEXO_DA_VITIMA"].isin(["", "Nao se aplica", "Nao informado na base municipal"])]
     if base.empty:
         return pd.DataFrame(columns=["SEXO_DA_VITIMA", "VITIMAS", "PARTICIPACAO_%"])
     tab = base.groupby("SEXO_DA_VITIMA", as_index=False)["VITIMAS"].sum().sort_values("VITIMAS", ascending=False)
@@ -521,6 +565,7 @@ def tabela_crime_sexo(df_vitimas, top_crimes=12):
     base = df_vitimas.copy()
     base["VITIMAS"] = pd.to_numeric(base["VITIMAS"], errors="coerce").fillna(0)
     base = base[base["VITIMAS"] > 0]
+    base = base[~base["SEXO_DA_VITIMA"].isin(["", "Nao se aplica", "Nao informado na base municipal"])]
     if base.empty:
         return pd.DataFrame()
     crimes_top = base.groupby("TIPO_CRIME")["VITIMAS"].sum().sort_values(ascending=False).head(top_crimes).index.tolist()
@@ -559,7 +604,6 @@ if not meta.get("ok"):
 
 path = meta["parquet_path"]
 uf_sel = st.sidebar.selectbox("Estado:", sorted(UFS), index=sorted(UFS).index("MG"))
-
 municipio_sel = "Todos os municipios"
 crime_sel = "Todos os indicadores"
 sexo_sel = "Todos os sexos"
@@ -570,7 +614,7 @@ if tipo == "municipios":
     municipio_sel = st.sidebar.selectbox("Municipio:", ["Todos os municipios"] + municipios)
     metrica_label = "Vitimas"
     metrica_coluna = "VITIMAS"
-    unidade = None
+    metrica_fonte = "VITIMAS"
     crime_sel = "Homicidio doloso"
     st.sidebar.markdown("**Indicador fixo:** Homicidio doloso")
     st.sidebar.markdown("**Unidade:** Vitimas")
@@ -578,13 +622,13 @@ if tipo == "municipios":
 else:
     metrica_label = st.sidebar.selectbox("Metrica principal:", ["Ocorrencias", "Vitimas"], index=0)
     metrica_coluna = "OCORRENCIAS" if metrica_label == "Ocorrencias" else "VITIMAS"
-    unidade = metrica_label
-    crimes = distinct_values(path, "TIPO_CRIME", tipo, uf=uf_sel, unidade=unidade)
+    metrica_fonte = "OCORRENCIAS" if metrica_label == "Ocorrencias" else "VITIMAS"
+    crimes = distinct_values(path, "TIPO_CRIME", tipo, uf=uf_sel, metrica=metrica_fonte)
     crimes = sorted(set([c for c in crimes if str(c).strip()]))
     crime_sel = st.sidebar.selectbox("Indicador/tipo de crime:", ["Todos os indicadores"] + crimes)
-    if metrica_label == "Vitimas":
-        sexos = distinct_values(path, "SEXO_DA_VITIMA", tipo, uf=uf_sel, crime=crime_sel, unidade="Vitimas")
-        sexos = sorted(set([s for s in sexos if str(s).strip()]))
+    if metrica_fonte == "VITIMAS":
+        sexos = distinct_values(path, "SEXO_DA_VITIMA", tipo, uf=uf_sel, crime=crime_sel, metrica="VITIMAS")
+        sexos = sorted(set([s for s in sexos if str(s).strip() and s != "Nao se aplica"]))
         if sexos:
             sexo_sel = st.sidebar.selectbox("Sexo da vitima:", ["Todos os sexos"] + sexos)
     st.sidebar.info("A base UF possui ocorrencias por tipo de crime e vitimas por sexo/tipo de crime.")
@@ -596,7 +640,7 @@ anos = distinct_values(
     uf=uf_sel,
     municipio=municipio_sel if tipo == "municipios" else None,
     crime=crime_sel if tipo != "municipios" else None,
-    unidade=unidade if tipo != "municipios" else None,
+    metrica=metrica_fonte if tipo != "municipios" else None,
 )
 anos = sorted([a for a in anos if re.fullmatch(r"\d{4}", str(a))], reverse=True)
 ano_sel = st.sidebar.selectbox("Ano:", ["Todos os anos"] + anos, index=1 if anos else 0)
@@ -635,12 +679,12 @@ st.markdown(
 )
 
 if tipo == "municipios":
-    df_main = query_df(path, tipo, uf=uf_sel, municipio=municipio_sel, ano=ano_sel, mes=mes_sel)
+    df_main = query_df(path, tipo, uf=uf_sel, municipio=municipio_sel, ano=ano_sel, mes=mes_sel, only_positive=False)
     df_vitimas = pd.DataFrame()
 else:
-    df_main = query_df(path, tipo, uf=uf_sel, crime=crime_sel, ano=ano_sel, mes=mes_sel, unidade=unidade, sexo=sexo_sel)
-    # Analise complementar: sempre consulta UNIDADE_MEDIDA = Vitimas, sem filtro por sexo, para permitir distribuicao por sexo.
-    df_vitimas = query_df(path, tipo, uf=uf_sel, crime=crime_sel, ano=ano_sel, mes=mes_sel, unidade="Vitimas")
+    df_main = query_df(path, tipo, uf=uf_sel, crime=crime_sel, ano=ano_sel, mes=mes_sel, metrica=metrica_fonte, sexo=sexo_sel, only_positive=False)
+    # Analise complementar de vitimas: nunca depende de ABA_ORIGEM acentuada; usa METRICA_FONTE = VITIMAS.
+    df_vitimas = query_df(path, tipo, uf=uf_sel, crime=crime_sel, ano=ano_sel, mes=mes_sel, metrica="VITIMAS", only_positive=False)
 
 if df_main.empty:
     st.warning("Nao foram encontrados registros para a combinacao selecionada.")
@@ -651,10 +695,10 @@ if df_main.empty:
         "crime": crime_sel,
         "ano": ano_sel,
         "mes": mes_nome,
-        "unidade": unidade,
+        "metrica_fonte": metrica_fonte if tipo != "municipios" else "VITIMAS",
         "linhas_uf": count_rows(path, tipo, uf=uf_sel),
         "linhas_uf_municipio": count_rows(path, tipo, uf=uf_sel, municipio=municipio_sel) if tipo == "municipios" else None,
-        "unidades_disponiveis": distinct_values(path, "UNIDADE_MEDIDA", tipo, uf=uf_sel) if tipo == "uf" else ["Vitimas"],
+        "metricas_disponiveis": distinct_values(path, "METRICA_FONTE", tipo, uf=uf_sel),
         "abas_disponiveis": distinct_values(path, "ABA_ORIGEM", tipo, uf=uf_sel),
         "anos_disponiveis_no_contexto": anos,
         "cache": meta,
@@ -663,12 +707,15 @@ if df_main.empty:
 
 # Totais principais
 total_principal = pd.to_numeric(df_main[metrica_coluna], errors="coerce").fillna(0).sum()
+if tipo == "uf" and df_vitimas.empty:
+    # Fallback defensivo: se por algum motivo o filtro de metrica falhar, busca linhas com VITIMAS > 0 no contexto.
+    df_vitimas = query_df(path, tipo, uf=uf_sel, crime=crime_sel, ano=ano_sel, mes=mes_sel, metrica=None, only_positive=True)
+
 total_vitimas_complementar = pd.to_numeric(df_vitimas["VITIMAS"], errors="coerce").fillna(0).sum() if not df_vitimas.empty else 0
 linhas = len(df_main)
 localidade = f"{municipio_sel} - {uf_sel}" if tipo == "municipios" and municipio_sel != "Todos os municipios" else (f"Municipios de {uf_sel}" if tipo == "municipios" else f"Estado {uf_sel}")
 periodo = f"{ano_sel} | {mes_nome}"
 
-# Prepara resumos de vitimas UF
 sexo_tab = resumo_sexo(df_vitimas) if tipo == "uf" else pd.DataFrame()
 vitimas_crime_tab = resumo_vitimas_por_crime(df_vitimas, top=15) if tipo == "uf" else pd.DataFrame()
 crime_sexo_tab = tabela_crime_sexo(df_vitimas, top_crimes=12) if tipo == "uf" else pd.DataFrame()
@@ -687,6 +734,14 @@ if tipo == "municipios":
         metric_card("📋 Linhas", fmt_int(linhas), "Registros retornados", "#f0ad4e")
     with c4:
         metric_card("📍 Localidade", localidade, periodo, "#1c2d42")
+    st.markdown(
+        """
+        <div class="warning-box">
+        <b>Base municipal:</b> somente Homicidio doloso, medido em Vitimas. A base municipal oficial nao possui todos os tipos de crime nem sexo da vitima.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 else:
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -707,19 +762,22 @@ if tipo == "uf":
     if df_vitimas.empty or (sexo_tab.empty and vitimas_crime_tab.empty):
         st.warning("A estrutura de Vitimas nao retornou dados para os filtros de UF/ano/mes/crime selecionados.")
     else:
+        total_v = total_vitimas_complementar
+        masc = float(sexo_dict.get("Masculino", 0))
+        fem = float(sexo_dict.get("Feminino", 0))
+        ni = float(sexo_dict.get("Sexo NI", 0))
         s1, s2, s3, s4, s5 = st.columns(5)
         with s1:
-            metric_card("👥 Total de vitimas", fmt_int(total_vitimas_complementar), "Total na aba Vitimas", "#0b2239")
+            metric_card("👥 Total de vitimas", fmt_int(total_v), "Total na estrutura Vitimas", "#0b2239")
         with s2:
-            metric_card("♂ Masculino", fmt_int(sexo_dict.get("Masculino", 0)), "Vitimas masculinas", "#1c2d42")
+            metric_card("♂ Masculino", fmt_int(masc), f"{fmt_pct(masc / total_v * 100 if total_v else 0)} do total", "#1c2d42")
         with s3:
-            metric_card("♀ Feminino", fmt_int(sexo_dict.get("Feminino", 0)), "Vitimas femininas", "#d9534f")
+            metric_card("♀ Feminino", fmt_int(fem), f"{fmt_pct(fem / total_v * 100 if total_v else 0)} do total", "#d9534f")
         with s4:
-            metric_card("NI", fmt_int(sexo_dict.get("Sexo NI", 0)), "Sexo nao informado", "#f0ad4e")
+            metric_card("NI", fmt_int(ni), "Sexo nao informado", "#f0ad4e")
         with s5:
             metric_card("🔎 Crime com mais vitimas", crime_top, f"{fmt_int(crime_top_v)} vitimas", "#1c2d42")
 
-# Abas do painel
 aba_painel, aba_dados, aba_diag, aba_export = st.tabs(["📊 Painel Estatistico", "📋 Dados Tratados", "⚙️ Diagnostico", "📥 Exportacao"])
 
 with aba_painel:
@@ -759,12 +817,14 @@ with aba_painel:
                 st.info("Sem recorte por sexo para estes filtros.")
             else:
                 st.bar_chart(sexo_tab.set_index("SEXO_DA_VITIMA")["VITIMAS"])
+                st.dataframe(sexo_tab, width="stretch", hide_index=True)
         with csexo2:
             st.write("**Vitimas por tipo de crime**")
             if vitimas_crime_tab.empty:
                 st.info("Sem vitimas por tipo de crime para estes filtros.")
             else:
                 st.bar_chart(vitimas_crime_tab.set_index("TIPO_CRIME")["VITIMAS"])
+                st.dataframe(vitimas_crime_tab, width="stretch", hide_index=True)
 
         with st.expander("Tabela detalhada: tipo de crime x sexo da vitima", expanded=True):
             if crime_sexo_tab.empty:
@@ -779,7 +839,7 @@ with aba_painel:
 with aba_dados:
     cols = [
         "ANO", "MES_NOME", "UF", "MUNICIPIO", "TIPO_CRIME", "UNIDADE_MEDIDA", "SEXO_DA_VITIMA",
-        "OCORRENCIAS", "VITIMAS", "CODIGO_MUNICIPIO", "ABA_ORIGEM", "FONTE_PROCESSADA",
+        "OCORRENCIAS", "VITIMAS", "CODIGO_MUNICIPIO", "METRICA_FONTE", "ABA_ORIGEM", "FONTE_PROCESSADA",
     ]
     cols = [c for c in cols if c in df_main.columns]
     st.write("**Dados da metrica principal**")
@@ -800,18 +860,23 @@ with aba_diag:
         "ano": ano_sel,
         "mes": mes_nome,
         "metrica_principal": metrica_label,
+        "metrica_fonte": metrica_fonte if tipo != "municipios" else "VITIMAS",
         "linhas_main": int(len(df_main)),
         "linhas_vitimas_complementar": int(len(df_vitimas)) if tipo == "uf" else None,
         "total_principal": float(total_principal),
         "total_vitimas_complementar": float(total_vitimas_complementar),
+        "metricas_disponiveis_uf": distinct_values(path, "METRICA_FONTE", tipo, uf=uf_sel),
         "abas_disponiveis": distinct_values(path, "ABA_ORIGEM", tipo, uf=uf_sel),
-        "unidades_disponiveis": distinct_values(path, "UNIDADE_MEDIDA", tipo, uf=uf_sel) if tipo == "uf" else ["Vitimas"],
-        "sexo_disponivel": distinct_values(path, "SEXO_DA_VITIMA", tipo, uf=uf_sel, unidade="Vitimas") if tipo == "uf" else [],
+        "sexo_disponivel": distinct_values(path, "SEXO_DA_VITIMA", tipo, uf=uf_sel, metrica="VITIMAS") if tipo == "uf" else [],
+        "crimes_vitimas_disponiveis": distinct_values(path, "TIPO_CRIME", tipo, uf=uf_sel, metrica="VITIMAS") if tipo == "uf" else [],
         "observacao_municipal": "Municipio e fixo em Homicidio doloso/Vitimas; nao ha filtro de tipo de crime, ocorrencias ou sexo." if tipo == "municipios" else None,
         "cache": meta,
     })
-    st.write("**Amostra filtrada**")
+    st.write("**Amostra filtrada da metrica principal**")
     st.dataframe(df_main.head(80), width="stretch", hide_index=True)
+    if tipo == "uf" and not df_vitimas.empty:
+        st.write("**Amostra filtrada de vitimas**")
+        st.dataframe(df_vitimas.head(80), width="stretch", hide_index=True)
 
 with aba_export:
     st.download_button(
