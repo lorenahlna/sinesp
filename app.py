@@ -1,14 +1,18 @@
-# VERSION_FINAL_PRODUCAO_SEGURANCA_DASHBOARD_V5
+# VERSION_FINAL_PRODUCAO_SEGURANCA_DASHBOARD_V6_DUCKDB
 # App Streamlit para dados de seguranca publica
 # Fonte principal: base oficial MJSP/SINESP em XLSX
 # Fonte experimental: API comunitaria rayonnunes/api_seguranca_publica
-# V5: separa corretamente a logica municipal (vitimas/homicidio doloso) da logica UF (ocorrencias/vitimas)
+# V6: usa cache em Parquet + DuckDB para filtrar antes de materializar a base no Streamlit
 
 import io
+import json
+import os
 import re
+import tempfile
 import unicodedata
 from datetime import datetime
 
+import duckdb
 import pandas as pd
 import requests
 import streamlit as st
@@ -268,6 +272,33 @@ def formatar_inteiro(valor):
         return "0"
 
 
+def parse_data_mista(texto_original):
+    """Converte datas sem gerar warning de dayfirst em formato ISO.
+
+    O aviso informado no log ocorre quando pandas recebe uma string no formato
+    YYYY-MM-DD HH:MM:SS e, ao mesmo tempo, dayfirst=True. Aqui detectamos o
+    formato antes e passamos format explicito.
+    """
+    if pd.isna(texto_original):
+        return pd.NaT
+    s = str(texto_original).strip()
+    if not s:
+        return pd.NaT
+
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", s):
+        return pd.to_datetime(s, errors="coerce", format="%Y-%m-%d %H:%M:%S")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return pd.to_datetime(s, errors="coerce", format="%Y-%m-%d")
+    if re.fullmatch(r"\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}", s):
+        return pd.to_datetime(s, errors="coerce", format="%d/%m/%Y %H:%M:%S")
+    if re.fullmatch(r"\d{2}/\d{2}/\d{4}", s):
+        return pd.to_datetime(s, errors="coerce", format="%d/%m/%Y")
+    if re.fullmatch(r"\d{2}/\d{4}", s):
+        return pd.to_datetime("01/" + s, errors="coerce", format="%d/%m/%Y")
+
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+
 def mes_para_ordem(valor):
     if pd.isna(valor):
         return None
@@ -275,8 +306,7 @@ def mes_para_ordem(valor):
     if texto_original == "":
         return None
 
-    # Trata datas completas, caso alguma planilha venha com referencia temporal.
-    dt = pd.to_datetime(texto_original, errors="coerce", dayfirst=True)
+    dt = parse_data_mista(texto_original)
     if pd.notna(dt):
         return int(dt.month)
 
@@ -285,7 +315,6 @@ def mes_para_ordem(valor):
     if texto_sem_ponto in MES_NORMALIZADO:
         return MES_NORMALIZADO[texto_sem_ponto]
 
-    # Casos como "01 - Janeiro" ou "1/Janeiro".
     match = re.search(r"\b(0?[1-9]|1[0-2])\b", texto_sem_ponto)
     if match:
         return int(match.group(1))
@@ -302,7 +331,7 @@ def ano_para_texto(valor):
     if texto_original == "":
         return None
 
-    dt = pd.to_datetime(texto_original, errors="coerce", dayfirst=True)
+    dt = parse_data_mista(texto_original)
     if pd.notna(dt):
         return str(int(dt.year))
 
@@ -311,11 +340,9 @@ def ano_para_texto(valor):
     if match4:
         return match4.group(1)
 
-    # Casos como JAN/25, 01-25, MAI_2025 ja seriam pegos acima.
     match2 = re.search(r"(?:^|[/_\-\s])(\d{2})(?:$|\D)", texto)
     if match2:
         yy = int(match2.group(1))
-        # As bases usadas no app sao recentes; 00-49 => 2000-2049, caso contrario 1900.
         return str(2000 + yy if yy <= 49 else 1900 + yy)
 
     return None
@@ -546,9 +573,58 @@ def ler_excel_oficial_multiplas_abas(conteudo_bytes):
     return pd.concat(frames, ignore_index=True, sort=False), metadados_abas
 
 
+def adicionar_colunas_filtro(df):
+    """Cria colunas auxiliares para filtro SQL no DuckDB.
+
+    Essas colunas evitam aplicar normalizacao pesada em pandas a cada consulta.
+    O filtro fica barato: DuckDB le o Parquet e materializa somente o recorte.
+    """
+    df = df.copy()
+    if "UF" in df.columns:
+        df["UF_FILTRO"] = df["UF"].astype(str).str.upper().str.strip()
+    else:
+        df["UF_FILTRO"] = ""
+
+    if "MUNICIPIO" in df.columns:
+        df["MUNICIPIO_FILTRO"] = df["MUNICIPIO"].map(chave_comparacao)
+    else:
+        df["MUNICIPIO_FILTRO"] = ""
+
+    if "TIPO_CRIME" in df.columns:
+        df["TIPO_CRIME_FILTRO"] = df["TIPO_CRIME"].map(chave_comparacao)
+    else:
+        df["TIPO_CRIME_FILTRO"] = ""
+
+    if "ANO" in df.columns:
+        df["ANO_FILTRO"] = df["ANO"].astype(str).str.strip()
+    else:
+        df["ANO_FILTRO"] = ""
+
+    if "MES_ORDEM" in df.columns:
+        df["MES_ORDEM_NUM"] = pd.to_numeric(df["MES_ORDEM"], errors="coerce")
+    else:
+        df["MES_ORDEM_NUM"] = pd.NA
+
+    return df
+
+
+def caminho_parquet_cache(tipo_base):
+    pasta = os.path.join(tempfile.gettempdir(), "sinesp_mjsp_cache_duckdb")
+    os.makedirs(pasta, exist_ok=True)
+    return os.path.join(pasta, f"mjsp_sinesp_{tipo_base}.parquet")
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
-def carregar_base_oficial(tipo_base):
+def preparar_base_oficial_parquet(tipo_base):
+    """Baixa a base oficial, padroniza uma vez e grava em Parquet.
+
+    A operacao pesada continua existindo na primeira carga do dia, porque o MJSP
+    publica XLSX e XLSX nao permite filtro remoto por UF/municipio. Depois disso,
+    cada consulta usa DuckDB diretamente sobre Parquet, sem materializar a base inteira.
+    """
     url = URL_MJSP_MUNICIPIOS if tipo_base == "municipios" else URL_MJSP_UF
+    parquet_path = caminho_parquet_cache(tipo_base)
+
     try:
         resp = requests.get(
             url,
@@ -557,40 +633,195 @@ def carregar_base_oficial(tipo_base):
             headers={"User-Agent": "Mozilla/5.0"},
         )
         if resp.status_code != 200:
-            return pd.DataFrame(), {
+            return {
                 "ok": False,
                 "erro": f"HTTP {resp.status_code}",
                 "url": url,
                 "texto": resp.text[:1500],
+                "parquet_path": parquet_path,
             }
 
         df_raw, meta_abas = ler_excel_oficial_multiplas_abas(resp.content)
         if df_raw.empty:
-            return pd.DataFrame(), {
+            return {
                 "ok": False,
                 "erro": "XLSX carregado, mas nenhuma aba util foi identificada.",
                 "url": url,
                 "abas": meta_abas,
                 "texto": "",
+                "parquet_path": parquet_path,
             }
 
         df = padronizar_base_seguranca(df_raw, f"oficial_mjsp_{tipo_base}")
-        return df, {
+        df = adicionar_colunas_filtro(df)
+        df.to_parquet(parquet_path, index=False)
+
+        colunas = list(df.columns)
+        return {
             "ok": True,
             "url": url,
-            "linhas_brutas": len(df_raw),
-            "linhas": len(df),
+            "linhas_brutas": int(len(df_raw)),
+            "linhas": int(len(df)),
             "abas": meta_abas,
-            "colunas": list(df.columns),
+            "colunas": colunas,
+            "parquet_path": parquet_path,
+            "motor_filtro": "DuckDB sobre Parquet local em cache",
         }
 
     except Exception as e:
-        return pd.DataFrame(), {
+        return {
             "ok": False,
             "erro": str(e),
             "url": url,
             "texto": "",
+            "parquet_path": parquet_path,
         }
+
+
+def construir_where_duckdb(uf, municipio, crime, ano, mes_num):
+    clauses = []
+    params = []
+
+    if uf:
+        clauses.append("UF_FILTRO = ?")
+        params.append(uf.upper())
+
+    if municipio:
+        chave_mun = chave_comparacao(municipio)
+        clauses.append("(MUNICIPIO_FILTRO = ? OR MUNICIPIO_FILTRO LIKE ?)")
+        params.extend([chave_mun, f"%{chave_mun}%"])
+
+    if crime and crime != "Todos os indicadores":
+        chave_crime = chave_comparacao(crime)
+        clauses.append("TIPO_CRIME_FILTRO = ?")
+        params.append(chave_crime)
+
+    if ano and ano != "Todos os anos":
+        clauses.append("ANO_FILTRO = ?")
+        params.append(str(ano))
+
+    if mes_num:
+        clauses.append("CAST(MES_ORDEM_NUM AS INTEGER) = ?")
+        params.append(int(mes_num))
+
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return where, params
+
+
+def query_base_oficial_duckdb(parquet_path, uf, municipio, crime, ano, mes_num, limit=None):
+    if not parquet_path or not os.path.exists(parquet_path):
+        return pd.DataFrame()
+
+    path_sql = parquet_path.replace("'", "''")
+    where, params = construir_where_duckdb(uf, municipio, crime, ano, mes_num)
+    limite_sql = f" LIMIT {int(limit)}" if limit else ""
+    query = f"SELECT * FROM read_parquet('{path_sql}'){where}{limite_sql}"
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        return con.execute(query, params).fetchdf()
+    finally:
+        con.close()
+
+
+def contar_duckdb(parquet_path, where="", params=None):
+    if params is None:
+        params = []
+    if not parquet_path or not os.path.exists(parquet_path):
+        return 0
+    path_sql = parquet_path.replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        return int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{path_sql}'){where}", params).fetchone()[0])
+    finally:
+        con.close()
+
+
+def diagnosticar_etapas_filtro_duckdb(parquet_path, uf, municipio, crime, ano, mes_num):
+    etapas = []
+    etapas.append({"etapa": "Base completa carregada em Parquet", "linhas": contar_duckdb(parquet_path)})
+
+    filtros = []
+    params = []
+
+    if uf:
+        filtros.append("UF_FILTRO = ?")
+        params.append(uf.upper())
+        etapas.append({"etapa": f"Apos filtro UF = {uf}", "linhas": contar_duckdb(parquet_path, " WHERE " + " AND ".join(filtros), params)})
+
+    if municipio:
+        chave_mun = chave_comparacao(municipio)
+        filtros.append("(MUNICIPIO_FILTRO = ? OR MUNICIPIO_FILTRO LIKE ?)")
+        params.extend([chave_mun, f"%{chave_mun}%"])
+        etapas.append({"etapa": f"Apos filtro municipio = {municipio}", "linhas": contar_duckdb(parquet_path, " WHERE " + " AND ".join(filtros), params)})
+
+    if crime and crime != "Todos os indicadores":
+        filtros.append("TIPO_CRIME_FILTRO = ?")
+        params.append(chave_comparacao(crime))
+        etapas.append({"etapa": f"Apos filtro indicador = {crime}", "linhas": contar_duckdb(parquet_path, " WHERE " + " AND ".join(filtros), params)})
+
+    if ano and ano != "Todos os anos":
+        filtros.append("ANO_FILTRO = ?")
+        params.append(str(ano))
+        etapas.append({"etapa": f"Apos filtro ano = {ano}", "linhas": contar_duckdb(parquet_path, " WHERE " + " AND ".join(filtros), params)})
+
+    if mes_num:
+        filtros.append("CAST(MES_ORDEM_NUM AS INTEGER) = ?")
+        params.append(int(mes_num))
+        etapas.append({"etapa": f"Apos filtro mes = {mes_num}", "linhas": contar_duckdb(parquet_path, " WHERE " + " AND ".join(filtros), params)})
+
+    amostra = query_base_oficial_duckdb(parquet_path, uf, municipio, crime, ano, mes_num, limit=30)
+
+    # contexto UF/municipio para listar anos e indicadores existentes sem carregar tudo
+    contexto_where, contexto_params = construir_where_duckdb(uf, municipio, "Todos os indicadores", "Todos os anos", None)
+    path_sql = parquet_path.replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        anos = con.execute(
+            f"SELECT DISTINCT ANO_FILTRO FROM read_parquet('{path_sql}'){contexto_where} WHERE ANO_FILTRO IS NOT NULL" if not contexto_where else f"SELECT DISTINCT ANO_FILTRO FROM read_parquet('{path_sql}'){contexto_where}",
+            contexto_params,
+        ).fetchdf()
+        crimes = con.execute(
+            f"SELECT DISTINCT TIPO_CRIME FROM read_parquet('{path_sql}'){contexto_where}",
+            contexto_params,
+        ).fetchdf()
+    except Exception:
+        anos = pd.DataFrame()
+        crimes = pd.DataFrame()
+    finally:
+        con.close()
+
+    return {
+        "etapas": etapas,
+        "amostra_contexto": amostra,
+        "anos_disponiveis_no_contexto": sorted([str(x) for x in anos.get("ANO_FILTRO", pd.Series(dtype=str)).dropna().tolist()], reverse=True)[:30],
+        "indicadores_disponiveis_no_contexto": sorted([str(x) for x in crimes.get("TIPO_CRIME", pd.Series(dtype=str)).dropna().tolist()])[:50],
+    }
+
+
+def opcoes_anos_padrao():
+    ano_atual = datetime.now().year
+    return ["Todos os anos"] + [str(a) for a in range(ano_atual, 2014, -1)]
+
+
+def opcoes_crimes_padrao(usa_oficial_municipios, usa_oficial_uf):
+    if usa_oficial_municipios:
+        return ["Todos os indicadores", "Homicidio doloso"]
+    if usa_oficial_uf:
+        return [
+            "Todos os indicadores",
+            "Estupro",
+            "Furto de veiculo",
+            "Homicidio doloso",
+            "Lesao corporal seguida de morte",
+            "Roubo a instituicao financeira",
+            "Roubo de carga",
+            "Roubo de veiculo",
+            "Roubo seguido de morte (latrocinio)",
+            "Tentativa de homicidio",
+        ]
+    return ["Todos os indicadores"]
+
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -980,30 +1211,13 @@ usa_oficial_municipios = fonte_dados.startswith("Oficial") and "Municipios" in f
 usa_oficial_uf = fonte_dados.startswith("Oficial") and "UF" in fonte_dados
 usa_api = fonte_dados.startswith("API")
 
-base_oficial = pd.DataFrame()
-meta_oficial = {}
-
-if usa_oficial_municipios:
-    with st.sidebar.status("Carregando base oficial municipal...", expanded=False) as status:
-        base_oficial, meta_oficial = carregar_base_oficial("municipios")
-        if meta_oficial.get("ok"):
-            status.update(label="Base municipal carregada", state="complete")
-        else:
-            status.update(label="Falha ao carregar base municipal", state="error")
-elif usa_oficial_uf:
-    with st.sidebar.status("Carregando base oficial UF...", expanded=False) as status:
-        base_oficial, meta_oficial = carregar_base_oficial("uf")
-        if meta_oficial.get("ok"):
-            status.update(label="Base UF carregada", state="complete")
-        else:
-            status.update(label="Falha ao carregar base UF", state="error")
-
 uf_sel = st.sidebar.selectbox("Selecione o Estado:", sorted(UFS), index=sorted(UFS).index("MG"))
 
 municipio_sel = "Todos os municipios"
 municipio_param = None
 if usa_oficial_municipios or usa_api:
-    municipios = obter_opcoes_municipios(base_oficial if usa_oficial_municipios else pd.DataFrame(), uf_sel)
+    # Municipio vem do IBGE, sem carregar a base oficial inteira no sidebar.
+    municipios = buscar_municipios_ibge(uf_sel)
     municipio_sel = st.sidebar.selectbox(
         "Selecione o Municipio:",
         ["Todos os municipios"] + municipios,
@@ -1018,20 +1232,17 @@ mes_param = MESES_DISPLAY[mes_nome]
 if usa_api:
     crime_nome = st.sidebar.selectbox("Classificacao do crime:", list(MAPA_CRIMES_API.keys()))
     crime_param = MAPA_CRIMES_API[crime_nome]
-    ano_opcoes = ["Todos os anos"] + [str(a) for a in range(datetime.now().year, 2014, -1)]
-    ano_sel = st.sidebar.selectbox("Ano de Referencia:", ano_opcoes, index=1)
+    ano_sel = st.sidebar.selectbox("Ano de Referencia:", opcoes_anos_padrao(), index=1)
 else:
-    if not base_oficial.empty:
-        mostrar_alerta_colunas(base_oficial, fonte_dados)
-    crime_opcoes = obter_opcoes_crimes(base_oficial)
+    crime_opcoes = opcoes_crimes_padrao(usa_oficial_municipios, usa_oficial_uf)
     if usa_oficial_municipios:
         st.sidebar.caption(
             "Na base oficial municipal, a unidade principal e vitimas. "
-            "Quando a base municipal trouxer apenas homicidio doloso, o app restringe a analise a esse indicador."
+            "O dicionario municipal indica foco em homicidio doloso/vitimas."
         )
     crime_nome = st.sidebar.selectbox("Indicador / Tipo de Crime:", crime_opcoes)
     crime_param = crime_nome
-    ano_sel = st.sidebar.selectbox("Ano de Referencia:", obter_opcoes_anos(base_oficial), index=0)
+    ano_sel = st.sidebar.selectbox("Ano de Referencia:", opcoes_anos_padrao(), index=1)
 
 with st.sidebar.form("form_seguranca"):
     submit_btn = st.form_submit_button("🔍 Consultar Indicadores")
@@ -1044,7 +1255,7 @@ if not submit_btn:
     st.markdown(
         """
         **Recomendacao de uso:** deixe a fonte oficial MJSP/SINESP como padrao para producao.  
-        A API comunitaria e util para testes, mas pode estar fora do ar, defasada ou limitada.
+        Nesta versao, o app nao carrega a base oficial inteira no sidebar: ele prepara um Parquet em cache e usa DuckDB para filtrar antes de exibir.
         """
     )
     st.stop()
@@ -1056,6 +1267,9 @@ st.markdown(
 )
 
 meta_api = {}
+meta_oficial = {}
+parquet_path = ""
+base_tipo = "municipios" if usa_oficial_municipios else "uf"
 
 if usa_api:
     with st.spinner("Consultando API comunitaria rayonnunes..."):
@@ -1067,28 +1281,28 @@ if usa_api:
             mes_num=mes_param,
         )
 else:
-    if base_oficial.empty:
-        st.error("Nao foi possivel carregar a base oficial selecionada.")
-        with st.expander("Diagnostico da carga oficial"):
-            st.json(meta_oficial)
-        st.stop()
+    with st.spinner("Preparando cache oficial MJSP/SINESP e filtrando com DuckDB..."):
+        meta_oficial = preparar_base_oficial_parquet(base_tipo)
+        parquet_path = meta_oficial.get("parquet_path", "")
 
-    with st.spinner("Filtrando base oficial MJSP/SINESP..."):
-        df_consulta = filtrar_base(
-            base_oficial,
-            uf=uf_sel,
-            municipio=municipio_param,
-            crime=crime_param,
-            ano=ano_sel,
-            mes_num=mes_param,
-        )
+        if not meta_oficial.get("ok"):
+            df_consulta = pd.DataFrame()
+        else:
+            df_consulta = query_base_oficial_duckdb(
+                parquet_path,
+                uf=uf_sel,
+                municipio=municipio_param,
+                crime=crime_param,
+                ano=ano_sel,
+                mes_num=mes_param,
+            )
 
 if df_consulta.empty:
     st.error(
         "🛑 Nao foram encontrados registros para a combinacao selecionada. "
         "Isso pode indicar ausencia de dados, indicador diferente na fonte, ano/mes indisponivel ou falha da fonte experimental."
     )
-    with st.expander("Diagnostico tecnico"):
+    with st.expander("Diagnostico tecnico", expanded=True):
         st.write("**Fonte selecionada:**", fonte_dados)
         st.write("**UF:**", uf_sel)
         st.write("**Municipio:**", municipio_param or "Todos")
@@ -1099,9 +1313,9 @@ if df_consulta.empty:
             st.json(meta_api)
         else:
             st.json(meta_oficial)
-            if not base_oficial.empty:
-                diag = diagnosticar_etapas_filtro(
-                    base_oficial,
+            if meta_oficial.get("ok"):
+                diag = diagnosticar_etapas_filtro_duckdb(
+                    parquet_path,
                     uf=uf_sel,
                     municipio=municipio_param,
                     crime=crime_param,
@@ -1115,15 +1329,11 @@ if df_consulta.empty:
                 st.write("Indicadores disponiveis para o contexto UF/municipio selecionado:")
                 st.write(diag.get("indicadores_disponiveis_no_contexto", []))
                 st.write("Colunas padronizadas carregadas:")
-                st.code("\n".join(base_oficial.columns.astype(str).tolist()))
-                st.write("Amostra contextual apos os filtros possiveis, nao a base completa:")
+                st.code("\n".join(meta_oficial.get("colunas", [])))
+                st.write("Amostra contextual filtrada pelo DuckDB:")
                 amostra = diag.get("amostra_contexto", pd.DataFrame())
                 if amostra.empty:
-                    st.info("Nao ha amostra para UF/municipio selecionados. Abaixo seguem as primeiras linhas da UF selecionada, se existirem.")
-                    if "UF" in base_oficial.columns:
-                        st.dataframe(base_oficial[base_oficial["UF"].astype(str).str.upper() == uf_sel.upper()].head(30), width="stretch")
-                    else:
-                        st.dataframe(base_oficial.head(30), width="stretch")
+                    st.info("Nao ha amostra para o filtro selecionado.")
                 else:
                     st.dataframe(amostra, width="stretch")
     st.stop()
@@ -1190,6 +1400,9 @@ if usa_oficial_municipios:
         "Por isso, os graficos e o card principal usam VITIMAS, nao OCORRENCIAS."
     )
 
+if not usa_api:
+    st.caption("Motor de filtro: DuckDB sobre Parquet local em cache. A primeira carga do XLSX ainda pode demorar, mas as consultas seguintes ficam mais leves.")
+
 st.caption(
     "Fonte: "
     + ("MJSP/SINESP - dados nacionais de seguranca publica" if not usa_api else "API comunitaria rayonnunes/api_seguranca_publica - experimental")
@@ -1232,11 +1445,11 @@ with tab3:
         st.write("**Metadados da API:**")
         st.json(meta_api)
     else:
-        st.write("**Metadados da base oficial:**")
+        st.write("**Metadados da base oficial/cache:**")
         st.json(meta_oficial)
         st.write("**Diagnostico das etapas do filtro:**")
-        diag_ok = diagnosticar_etapas_filtro(
-            base_oficial,
+        diag_ok = diagnosticar_etapas_filtro_duckdb(
+            parquet_path,
             uf=uf_sel,
             municipio=municipio_param,
             crime=crime_param,
@@ -1246,7 +1459,7 @@ with tab3:
         st.dataframe(pd.DataFrame(diag_ok["etapas"]), width="stretch")
     st.write("**Colunas finais:**")
     st.code("\n".join(df_consulta.columns.astype(str).tolist()))
-    st.write("**Amostra da consulta:**")
+    st.write("**Amostra da consulta já filtrada:**")
     st.dataframe(df_consulta.head(50), width="stretch")
 
 with tab4:
