@@ -1,7 +1,8 @@
-# VERSION_FINAL_PRODUCAO_SEGURANCA_DASHBOARD_V2
+# VERSION_FINAL_PRODUCAO_SEGURANCA_DASHBOARD_V5
 # App Streamlit para dados de seguranca publica
 # Fonte principal: base oficial MJSP/SINESP em XLSX
 # Fonte experimental: API comunitaria rayonnunes/api_seguranca_publica
+# V5: separa corretamente a logica municipal (vitimas/homicidio doloso) da logica UF (ocorrencias/vitimas)
 
 import io
 import re
@@ -292,6 +293,34 @@ def mes_para_ordem(valor):
     return None
 
 
+def ano_para_texto(valor):
+    """Extrai ano em 4 digitos de colunas como ANO, MES_ANO, Jan/2025 ou 01/2025."""
+    if pd.isna(valor):
+        return None
+
+    texto_original = str(valor).strip()
+    if texto_original == "":
+        return None
+
+    dt = pd.to_datetime(texto_original, errors="coerce", dayfirst=True)
+    if pd.notna(dt):
+        return str(int(dt.year))
+
+    texto = normalizar_valor(texto_original)
+    match4 = re.search(r"(19\d{2}|20\d{2})", texto)
+    if match4:
+        return match4.group(1)
+
+    # Casos como JAN/25, 01-25, MAI_2025 ja seriam pegos acima.
+    match2 = re.search(r"(?:^|[/_\-\s])(\d{2})(?:$|\D)", texto)
+    if match2:
+        yy = int(match2.group(1))
+        # As bases usadas no app sao recentes; 00-49 => 2000-2049, caso contrario 1900.
+        return str(2000 + yy if yy <= 49 else 1900 + yy)
+
+    return None
+
+
 def titulo_localidade(uf, municipio):
     if municipio:
         return f"{municipio} - {uf}"
@@ -367,26 +396,47 @@ def padronizar_base_seguranca(df, fonte):
     if "MUNICIPIO" in df.columns:
         df["MUNICIPIO"] = df["MUNICIPIO"].map(lambda x: str(x).strip().title())
 
+    # Algumas planilhas oficiais usam MES_ANO em vez de MES/ANO separados.
+    if "MES" not in df.columns and "MES_ANO" in df.columns:
+        df["MES"] = df["MES_ANO"]
+
     if "TIPO_CRIME" not in df.columns and "CRIME" in df.columns:
         df["TIPO_CRIME"] = df["CRIME"]
 
     if "CRIME" in df.columns and fonte == "api_rayonnunes":
         df["TIPO_CRIME"] = df["CRIME"].astype(str).map(REVERSE_CRIMES_API).fillna(df.get("TIPO_CRIME", "Outros"))
 
+    if "TIPO_CRIME" not in df.columns and "ABA_ORIGEM" in df.columns:
+        # Quando cada aba representa um indicador/crime, usa-se o nome da aba.
+        df["TIPO_CRIME"] = df["ABA_ORIGEM"]
+
     if "TIPO_CRIME" in df.columns:
         df["TIPO_CRIME"] = df["TIPO_CRIME"].astype(str).str.strip()
         df.loc[df["TIPO_CRIME"].isin(["", "nan", "None"]), "TIPO_CRIME"] = "Nao informado"
+        if "ABA_ORIGEM" in df.columns:
+            mascara_na = df["TIPO_CRIME"].map(lambda x: chave_comparacao(x) in ["", "NAOINFORMADO", "NAN", "NONE"])
+            df.loc[mascara_na, "TIPO_CRIME"] = df.loc[mascara_na, "ABA_ORIGEM"].astype(str).str.strip()
     else:
         df["TIPO_CRIME"] = "Nao informado"
 
     if "ANO" in df.columns:
-        df["ANO"] = df["ANO"].astype(str).str.extract(r"(\d{4})", expand=False).fillna(df["ANO"].astype(str))
+        ano_extraido = df["ANO"].map(ano_para_texto)
+        if "MES_ANO" in df.columns:
+            ano_extraido = ano_extraido.fillna(df["MES_ANO"].map(ano_para_texto))
+        df["ANO"] = ano_extraido.fillna("Nao informado")
+    elif "MES_ANO" in df.columns:
+        df["ANO"] = df["MES_ANO"].map(ano_para_texto).fillna("Nao informado")
     else:
         df["ANO"] = "Nao informado"
 
     if "MES" in df.columns:
         df["MES_ORDEM"] = df["MES"].map(mes_para_ordem)
+        if "MES_ANO" in df.columns:
+            df["MES_ORDEM"] = df["MES_ORDEM"].fillna(df["MES_ANO"].map(mes_para_ordem))
         df["MES_NOME"] = df["MES_ORDEM"].map(MES_LABEL).fillna(df["MES"].astype(str))
+    elif "MES_ANO" in df.columns:
+        df["MES_ORDEM"] = df["MES_ANO"].map(mes_para_ordem)
+        df["MES_NOME"] = df["MES_ORDEM"].map(MES_LABEL).fillna(df["MES_ANO"].astype(str))
     else:
         df["MES_ORDEM"] = None
         df["MES_NOME"] = "Nao informado"
@@ -407,9 +457,93 @@ def padronizar_base_seguranca(df, fonte):
     else:
         df["VITIMAS_MUNICIPIO"] = 0
 
+    # A base oficial municipal do MJSP/SINESP e documentada como base por
+    # municipio com unidade principal em vitimas. Portanto, nao se deve
+    # interpretar ausencia de OCORRENCIAS como zero ocorrencias criminais.
+    # Para o painel municipal, a metrica principal sera VITIMAS.
+    if fonte == "oficial_mjsp_municipios":
+        try:
+            if df["VITIMAS_MUNICIPIO"].sum() == 0 and df["VITIMAS"].sum() > 0:
+                df["VITIMAS_MUNICIPIO"] = df["VITIMAS"]
+        except Exception:
+            pass
+
     df["FONTE_PROCESSADA"] = fonte
     df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
+
+
+def detectar_linha_cabecalho_excel(conteudo_bytes, aba):
+    """Tenta localizar o cabecalho real quando a planilha vem com linhas de titulo/notas."""
+    try:
+        preview = pd.read_excel(
+            io.BytesIO(conteudo_bytes),
+            sheet_name=aba,
+            header=None,
+            nrows=15,
+            dtype=str,
+            engine="openpyxl",
+        )
+    except Exception:
+        return 0
+
+    palavras_chave = [
+        "UF", "MUNICIPIO", "CODIGO", "REGIAO", "ANO", "MES",
+        "CRIME", "INDICADOR", "OCORRENCIA", "VITIMA",
+    ]
+
+    melhor_linha = 0
+    melhor_pontos = -1
+    for idx, row in preview.iterrows():
+        valores = [normalizar_coluna(v) for v in row.dropna().tolist()]
+        if not valores:
+            continue
+        pontos = sum(
+            1 for palavra in palavras_chave
+            if any(palavra in valor for valor in valores)
+        )
+        if pontos > melhor_pontos:
+            melhor_pontos = pontos
+            melhor_linha = int(idx)
+
+    return melhor_linha if melhor_pontos >= 2 else 0
+
+
+def ler_excel_oficial_multiplas_abas(conteudo_bytes):
+    """Le todas as abas do XLSX oficial e concatena em uma unica base.
+
+    Isso evita o bug de carregar apenas a primeira aba da planilha, que pode fazer
+    a amostra mostrar outra UF/recorte enquanto o usuario selecionou BH, RJ, SP etc.
+    """
+    xls = pd.ExcelFile(io.BytesIO(conteudo_bytes), engine="openpyxl")
+    frames = []
+    metadados_abas = []
+
+    for aba in xls.sheet_names:
+        try:
+            header_row = detectar_linha_cabecalho_excel(conteudo_bytes, aba)
+            df_aba = pd.read_excel(
+                io.BytesIO(conteudo_bytes),
+                sheet_name=aba,
+                header=header_row,
+                dtype=str,
+                engine="openpyxl",
+            )
+            df_aba = df_aba.dropna(how="all")
+            df_aba = df_aba.loc[:, ~df_aba.columns.astype(str).str.startswith("Unnamed")]
+            if df_aba.empty:
+                metadados_abas.append({"aba": aba, "linhas": 0, "status": "vazia"})
+                continue
+            df_aba["ABA_ORIGEM"] = aba
+            frames.append(df_aba)
+            metadados_abas.append({"aba": aba, "linhas": len(df_aba), "cabecalho_linha": header_row})
+        except Exception as e:
+            metadados_abas.append({"aba": aba, "linhas": 0, "erro": str(e)})
+
+    if not frames:
+        return pd.DataFrame(), metadados_abas
+
+    return pd.concat(frames, ignore_index=True, sort=False), metadados_abas
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -430,10 +564,25 @@ def carregar_base_oficial(tipo_base):
                 "texto": resp.text[:1500],
             }
 
-        conteudo = io.BytesIO(resp.content)
-        df = pd.read_excel(conteudo, dtype=str, engine="openpyxl")
-        df = padronizar_base_seguranca(df, f"oficial_mjsp_{tipo_base}")
-        return df, {"ok": True, "url": url, "linhas": len(df), "colunas": list(df.columns)}
+        df_raw, meta_abas = ler_excel_oficial_multiplas_abas(resp.content)
+        if df_raw.empty:
+            return pd.DataFrame(), {
+                "ok": False,
+                "erro": "XLSX carregado, mas nenhuma aba util foi identificada.",
+                "url": url,
+                "abas": meta_abas,
+                "texto": "",
+            }
+
+        df = padronizar_base_seguranca(df_raw, f"oficial_mjsp_{tipo_base}")
+        return df, {
+            "ok": True,
+            "url": url,
+            "linhas_brutas": len(df_raw),
+            "linhas": len(df),
+            "abas": meta_abas,
+            "colunas": list(df.columns),
+        }
 
     except Exception as e:
         return pd.DataFrame(), {
@@ -446,9 +595,15 @@ def carregar_base_oficial(tipo_base):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def consultar_api_rayonnunes(uf, municipio, crime_id, ano, mes_num):
+    """
+    Consulta a API comunitaria rayonnunes com estrategia defensiva.
+
+    Motivo: essa API antiga frequentemente da timeout quando per_page=1000,
+    principalmente em municipios grandes ou consultas sem filtro de crime/mes.
+    A funcao tenta paginas menores automaticamente e registra diagnostico.
+    """
     params_base = {
         "uf": uf.lower(),
-        "per_page": 1000,
     }
 
     if municipio:
@@ -463,49 +618,95 @@ def consultar_api_rayonnunes(uf, municipio, crime_id, ano, mes_num):
     frames = []
     chamadas = []
     erros = []
-    max_paginas = 100
 
-    for pagina in range(1, max_paginas + 1):
-        params = dict(params_base)
-        params["page"] = pagina
+    # A documentacao da API aceita ate 1000 por pagina, mas 1000 costuma
+    # estourar timeout. Comecamos menor para aumentar a chance de resposta.
+    # Se ainda falhar, reduzimos novamente.
+    per_page_tentativas = [200, 100, 50]
+    timeout_por_chamada = 75
+    max_paginas = 200
+    houve_resposta_valida = False
 
-        try:
-            resp = requests.get(
-                API_RAYONNUNES,
-                params=params,
-                timeout=45,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            chamadas.append({"pagina": pagina, "url": resp.url, "status": resp.status_code})
+    for per_page in per_page_tentativas:
+        frames_tentativa = []
+        erros_tentativa = []
+        chamadas_tentativa = []
 
-            if resp.status_code != 200:
-                erros.append(f"Pagina {pagina}: HTTP {resp.status_code} - {resp.text[:500]}")
-                break
+        for pagina in range(1, max_paginas + 1):
+            params = dict(params_base)
+            params["per_page"] = per_page
+            params["page"] = pagina
 
             try:
-                payload = resp.json()
-            except Exception:
-                erros.append(f"Pagina {pagina}: resposta nao veio em JSON - {resp.text[:500]}")
+                resp = requests.get(
+                    API_RAYONNUNES,
+                    params=params,
+                    timeout=timeout_por_chamada,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                chamadas_tentativa.append(
+                    {
+                        "pagina": pagina,
+                        "per_page": per_page,
+                        "url": resp.url,
+                        "status": resp.status_code,
+                    }
+                )
+
+                if resp.status_code != 200:
+                    erros_tentativa.append(
+                        f"per_page={per_page}, pagina {pagina}: HTTP {resp.status_code} - {resp.text[:500]}"
+                    )
+                    break
+
+                try:
+                    payload = resp.json()
+                except Exception:
+                    erros_tentativa.append(
+                        f"per_page={per_page}, pagina {pagina}: resposta nao veio em JSON - {resp.text[:500]}"
+                    )
+                    break
+
+                dados = payload.get("data", []) if isinstance(payload, dict) else []
+                houve_resposta_valida = True
+
+                if not dados:
+                    # Fim normal da paginacao.
+                    break
+
+                frames_tentativa.append(pd.DataFrame(dados))
+
+                # Se vier menos do que o limite, acabou.
+                if len(dados) < per_page:
+                    break
+
+            except requests.exceptions.Timeout:
+                erros_tentativa.append(
+                    f"per_page={per_page}, pagina {pagina}: tempo limite excedido."
+                )
+                break
+            except requests.exceptions.RequestException as e:
+                erros_tentativa.append(
+                    f"per_page={per_page}, pagina {pagina}: falha de conexao - {e}"
+                )
+                break
+            except Exception as e:
+                erros_tentativa.append(
+                    f"per_page={per_page}, pagina {pagina}: erro inesperado - {e}"
+                )
                 break
 
-            dados = payload.get("data", []) if isinstance(payload, dict) else []
-            if not dados:
-                break
+        chamadas.extend(chamadas_tentativa)
+        erros.extend(erros_tentativa)
 
-            frames.append(pd.DataFrame(dados))
-
-            # A API limita a 1000 itens por pagina. Se vier menos, acabou.
-            if len(dados) < 1000:
-                break
-
-        except requests.exceptions.Timeout:
-            erros.append(f"Pagina {pagina}: tempo limite excedido.")
+        if frames_tentativa:
+            frames = frames_tentativa
+            erros.append(f"Consulta concluida usando per_page={per_page}.")
             break
-        except requests.exceptions.RequestException as e:
-            erros.append(f"Pagina {pagina}: falha de conexao - {e}")
-            break
-        except Exception as e:
-            erros.append(f"Pagina {pagina}: erro inesperado - {e}")
+
+        # Se a API respondeu sem dados, nao adianta tentar outro per_page.
+        # Diferente de timeout: resposta valida sem registros.
+        if houve_resposta_valida and not frames_tentativa and not erros_tentativa:
             break
 
     if frames:
@@ -514,9 +715,16 @@ def consultar_api_rayonnunes(uf, municipio, crime_id, ano, mes_num):
     else:
         df = pd.DataFrame()
 
-    meta = {"chamadas": chamadas, "erros": erros, "params": params_base}
+    meta = {
+        "chamadas": chamadas,
+        "erros": erros,
+        "params": params_base,
+        "observacao": (
+            "A API comunitaria pode ficar indisponivel ou exceder tempo de resposta. "
+            "Para producao, prefira a fonte oficial MJSP/SINESP em XLSX."
+        ),
+    }
     return df, meta
-
 
 def filtrar_base(df, uf, municipio, crime, ano, mes_num):
     if df is None or df.empty:
@@ -529,7 +737,12 @@ def filtrar_base(df, uf, municipio, crime, ano, mes_num):
 
     if municipio and "MUNICIPIO" in out.columns:
         chave_mun = chave_comparacao(municipio)
-        out = out[out["MUNICIPIO"].map(chave_comparacao) == chave_mun].copy()
+        chaves_base = out["MUNICIPIO"].map(chave_comparacao)
+        mascara_mun = chaves_base == chave_mun
+        # Fallback para casos como "Belo Horizonte/MG" ou "Belo Horizonte - MG".
+        if not mascara_mun.any():
+            mascara_mun = chaves_base.str.contains(chave_mun, na=False)
+        out = out[mascara_mun].copy()
 
     if crime and crime != "Todos os indicadores" and "TIPO_CRIME" in out.columns:
         chave_crime = chave_comparacao(crime)
@@ -584,6 +797,73 @@ def obter_opcoes_municipios(df, uf):
     return buscar_municipios_ibge(uf)
 
 
+def diagnosticar_etapas_filtro(df, uf, municipio, crime, ano, mes_num):
+    """Retorna contagens apos cada filtro para explicar por que uma consulta ficou vazia."""
+    etapas = []
+    amostra_contexto = pd.DataFrame()
+
+    if df is None or df.empty:
+        return {"etapas": [{"etapa": "Base completa", "linhas": 0}], "amostra_contexto": amostra_contexto}
+
+    atual = df.copy()
+    etapas.append({"etapa": "Base completa carregada", "linhas": len(atual)})
+
+    if "UF" in atual.columns and uf:
+        atual = atual[atual["UF"].astype(str).str.upper() == uf.upper()].copy()
+        etapas.append({"etapa": f"Apos filtro UF = {uf}", "linhas": len(atual)})
+        amostra_contexto = atual.head(30)
+
+    if municipio and "MUNICIPIO" in atual.columns:
+        chave_mun = chave_comparacao(municipio)
+        chaves_base = atual["MUNICIPIO"].map(chave_comparacao)
+        mascara_mun = chaves_base == chave_mun
+        if not mascara_mun.any():
+            mascara_mun = chaves_base.str.contains(chave_mun, na=False)
+        atual = atual[mascara_mun].copy()
+        etapas.append({"etapa": f"Apos filtro municipio = {municipio}", "linhas": len(atual)})
+        amostra_contexto = atual.head(30)
+
+    if crime and crime != "Todos os indicadores" and "TIPO_CRIME" in atual.columns:
+        chave_crime = chave_comparacao(crime)
+        atual = atual[atual["TIPO_CRIME"].map(chave_comparacao) == chave_crime].copy()
+        etapas.append({"etapa": f"Apos filtro indicador = {crime}", "linhas": len(atual)})
+        amostra_contexto = atual.head(30)
+
+    if ano and ano != "Todos os anos" and "ANO" in atual.columns:
+        atual = atual[atual["ANO"].astype(str) == str(ano)].copy()
+        etapas.append({"etapa": f"Apos filtro ano = {ano}", "linhas": len(atual)})
+        amostra_contexto = atual.head(30)
+
+    if mes_num and "MES_ORDEM" in atual.columns:
+        atual = atual[pd.to_numeric(atual["MES_ORDEM"], errors="coerce") == int(mes_num)].copy()
+        etapas.append({"etapa": f"Apos filtro mes = {mes_num}", "linhas": len(atual)})
+        amostra_contexto = atual.head(30)
+
+    resumo = {"etapas": etapas, "amostra_contexto": amostra_contexto}
+
+    # Opcoes disponiveis no contexto filtrado por UF/municipio, quando possivel.
+    contexto = df.copy()
+    if "UF" in contexto.columns and uf:
+        contexto = contexto[contexto["UF"].astype(str).str.upper() == uf.upper()].copy()
+    if municipio and "MUNICIPIO" in contexto.columns:
+        chave_mun = chave_comparacao(municipio)
+        chaves_base = contexto["MUNICIPIO"].map(chave_comparacao)
+        mascara_mun = chaves_base == chave_mun
+        if not mascara_mun.any():
+            mascara_mun = chaves_base.str.contains(chave_mun, na=False)
+        contexto = contexto[mascara_mun].copy()
+
+    resumo["anos_disponiveis_no_contexto"] = sorted(
+        {str(x) for x in contexto.get("ANO", pd.Series(dtype=str)).dropna().astype(str).tolist()},
+        reverse=True,
+    )[:30]
+    resumo["indicadores_disponiveis_no_contexto"] = sorted(
+        {str(x) for x in contexto.get("TIPO_CRIME", pd.Series(dtype=str)).dropna().astype(str).tolist()}
+    )[:50]
+
+    return resumo
+
+
 def mostrar_alerta_colunas(df, fonte_label):
     colunas_necessarias = ["UF", "ANO", "MES_ORDEM", "TIPO_CRIME", "OCORRENCIAS"]
     faltantes = [c for c in colunas_necessarias if c not in df.columns]
@@ -594,45 +874,89 @@ def mostrar_alerta_colunas(df, fonte_label):
         )
 
 
-def plotar_serie_mensal(df):
-    if df.empty or "MES_ORDEM" not in df.columns:
-        st.info("Nao ha dados mensais suficientes para montar a serie temporal.")
+def obter_metrica_principal(df, usa_base_municipal=False):
+    """Define a metrica principal respeitando a metodologia da fonte.
+
+    - Base oficial municipal: usar VITIMAS como metrica principal.
+    - Base oficial UF e API comunitaria: usar OCORRENCIAS quando existir.
+    """
+    if df is None or df.empty:
+        return "OCORRENCIAS", "Ocorrencias"
+
+    def coluna_tem_soma(coluna):
+        if coluna not in df.columns:
+            return False
+        return pd.to_numeric(df[coluna], errors="coerce").fillna(0).sum() > 0
+
+    if usa_base_municipal:
+        if coluna_tem_soma("VITIMAS"):
+            return "VITIMAS", "Vitimas"
+        if coluna_tem_soma("VITIMAS_MUNICIPIO"):
+            return "VITIMAS_MUNICIPIO", "Vitimas municipio"
+        return "VITIMAS", "Vitimas"
+
+    if coluna_tem_soma("OCORRENCIAS"):
+        return "OCORRENCIAS", "Ocorrencias"
+    if coluna_tem_soma("VITIMAS"):
+        return "VITIMAS", "Vitimas"
+    if coluna_tem_soma("VITIMAS_MUNICIPIO"):
+        return "VITIMAS_MUNICIPIO", "Vitimas municipio"
+    return "OCORRENCIAS", "Ocorrencias"
+
+
+def soma_segura(df, coluna):
+    if df is None or df.empty or coluna not in df.columns:
+        return 0
+    return pd.to_numeric(df[coluna], errors="coerce").fillna(0).sum()
+
+
+def plotar_serie_mensal(df, metrica_coluna="OCORRENCIAS", metrica_label="Ocorrencias"):
+    if df.empty or "MES_ORDEM" not in df.columns or metrica_coluna not in df.columns:
+        st.info(f"Nao ha dados mensais suficientes para montar a serie temporal de {metrica_label.lower()}.")
         return
     base = df.copy()
     base["MES_ORDEM"] = pd.to_numeric(base["MES_ORDEM"], errors="coerce")
+    base[metrica_coluna] = pd.to_numeric(base[metrica_coluna], errors="coerce").fillna(0)
     base = base.dropna(subset=["MES_ORDEM"])
     if base.empty:
-        st.info("Nao ha dados mensais validos para montar a serie temporal.")
+        st.info(f"Nao ha dados mensais validos para montar a serie temporal de {metrica_label.lower()}.")
         return
     serie = (
-        base.groupby("MES_ORDEM", dropna=True)["OCORRENCIAS"]
+        base.groupby("MES_ORDEM", dropna=True)[metrica_coluna]
         .sum()
         .reset_index()
         .sort_values("MES_ORDEM")
     )
     serie["MES"] = serie["MES_ORDEM"].astype(int).map(MES_LABEL)
-    serie = serie.set_index("MES")["OCORRENCIAS"]
+    serie = serie.set_index("MES")[metrica_coluna]
+    if serie.empty or serie.sum() == 0:
+        st.info(f"Nao ha valores de {metrica_label.lower()} para a serie temporal.")
+        return
     st.line_chart(serie)
 
 
-def plotar_crimes(df):
-    if df.empty or "TIPO_CRIME" not in df.columns:
-        st.info("Nao ha dados suficientes para a distribuicao por tipo de crime.")
+def plotar_crimes(df, metrica_coluna="OCORRENCIAS", metrica_label="Ocorrencias"):
+    if df.empty or "TIPO_CRIME" not in df.columns or metrica_coluna not in df.columns:
+        st.info("Nao ha dados suficientes para a distribuicao por indicador/tipo de crime.")
         return
-    serie = df.groupby("TIPO_CRIME")["OCORRENCIAS"].sum().sort_values(ascending=False).head(15)
+    base = df.copy()
+    base[metrica_coluna] = pd.to_numeric(base[metrica_coluna], errors="coerce").fillna(0)
+    serie = base.groupby("TIPO_CRIME")[metrica_coluna].sum().sort_values(ascending=False).head(15)
     if serie.empty or serie.sum() == 0:
-        st.info("Nao ha ocorrencias para a distribuicao por tipo de crime.")
+        st.info(f"Nao ha valores de {metrica_label.lower()} para a distribuicao por tipo de crime.")
         return
     st.bar_chart(serie)
 
 
-def plotar_top_municipios(df):
-    if df.empty or "MUNICIPIO" not in df.columns:
+def plotar_top_municipios(df, metrica_coluna="OCORRENCIAS", metrica_label="Ocorrencias"):
+    if df.empty or "MUNICIPIO" not in df.columns or metrica_coluna not in df.columns:
         st.info("Selecione a base municipal para ver o ranking por municipio.")
         return
-    serie = df.groupby("MUNICIPIO")["OCORRENCIAS"].sum().sort_values(ascending=False).head(15)
+    base = df.copy()
+    base[metrica_coluna] = pd.to_numeric(base[metrica_coluna], errors="coerce").fillna(0)
+    serie = base.groupby("MUNICIPIO")[metrica_coluna].sum().sort_values(ascending=False).head(15)
     if serie.empty or serie.sum() == 0:
-        st.info("Nao ha ocorrencias para montar o ranking municipal.")
+        st.info(f"Nao ha valores de {metrica_label.lower()} para montar o ranking municipal.")
         return
     st.bar_chart(serie)
 
@@ -700,6 +1024,11 @@ else:
     if not base_oficial.empty:
         mostrar_alerta_colunas(base_oficial, fonte_dados)
     crime_opcoes = obter_opcoes_crimes(base_oficial)
+    if usa_oficial_municipios:
+        st.sidebar.caption(
+            "Na base oficial municipal, a unidade principal e vitimas. "
+            "Quando a base municipal trouxer apenas homicidio doloso, o app restringe a analise a esse indicador."
+        )
     crime_nome = st.sidebar.selectbox("Indicador / Tipo de Crime:", crime_opcoes)
     crime_param = crime_nome
     ano_sel = st.sidebar.selectbox("Ano de Referencia:", obter_opcoes_anos(base_oficial), index=0)
@@ -771,40 +1100,79 @@ if df_consulta.empty:
         else:
             st.json(meta_oficial)
             if not base_oficial.empty:
+                diag = diagnosticar_etapas_filtro(
+                    base_oficial,
+                    uf=uf_sel,
+                    municipio=municipio_param,
+                    crime=crime_param,
+                    ano=ano_sel,
+                    mes_num=mes_param,
+                )
+                st.write("Contagem por etapa do filtro:")
+                st.dataframe(pd.DataFrame(diag["etapas"]), width="stretch")
+                st.write("Anos disponiveis para o contexto UF/municipio selecionado:")
+                st.write(diag.get("anos_disponiveis_no_contexto", []))
+                st.write("Indicadores disponiveis para o contexto UF/municipio selecionado:")
+                st.write(diag.get("indicadores_disponiveis_no_contexto", []))
                 st.write("Colunas padronizadas carregadas:")
                 st.code("\n".join(base_oficial.columns.astype(str).tolist()))
-                st.write("Amostra da base carregada:")
-                st.dataframe(base_oficial.head(20), width="stretch")
+                st.write("Amostra contextual apos os filtros possiveis, nao a base completa:")
+                amostra = diag.get("amostra_contexto", pd.DataFrame())
+                if amostra.empty:
+                    st.info("Nao ha amostra para UF/municipio selecionados. Abaixo seguem as primeiras linhas da UF selecionada, se existirem.")
+                    if "UF" in base_oficial.columns:
+                        st.dataframe(base_oficial[base_oficial["UF"].astype(str).str.upper() == uf_sel.upper()].head(30), width="stretch")
+                    else:
+                        st.dataframe(base_oficial.head(30), width="stretch")
+                else:
+                    st.dataframe(amostra, width="stretch")
     st.stop()
 
 # Cards
 localidade = titulo_localidade(uf_sel, municipio_param)
-total_ocorrencias = df_consulta["OCORRENCIAS"].sum() if "OCORRENCIAS" in df_consulta.columns else 0
-total_vitimas = df_consulta["VITIMAS"].sum() if "VITIMAS" in df_consulta.columns else 0
-total_vitimas_mun = df_consulta["VITIMAS_MUNICIPIO"].sum() if "VITIMAS_MUNICIPIO" in df_consulta.columns else 0
+metrica_coluna, metrica_label = obter_metrica_principal(
+    df_consulta,
+    usa_base_municipal=usa_oficial_municipios,
+)
+
+valor_principal = soma_segura(df_consulta, metrica_coluna)
+total_ocorrencias = soma_segura(df_consulta, "OCORRENCIAS")
+total_vitimas = soma_segura(df_consulta, "VITIMAS")
+total_vitimas_mun = soma_segura(df_consulta, "VITIMAS_MUNICIPIO")
 registros = len(df_consulta)
+
+if usa_oficial_municipios:
+    subtitulo_principal = "Unidade principal da base municipal"
+    titulo_card_secundario = "Ocorrencias"
+    valor_card_secundario = total_ocorrencias
+    nota_secundaria = "Pode vir zerado na base municipal"
+else:
+    subtitulo_principal = "Metrica principal do filtro"
+    titulo_card_secundario = "Vitimas"
+    valor_card_secundario = total_vitimas
+    nota_secundaria = "Quando informado pela fonte"
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.markdown(
-        f'<div class="metric-card"><h4>🚨 Ocorrencias</h4>'
-        f'<h2 style="color:#d9534f; margin:0;">{formatar_inteiro(total_ocorrencias)}</h2>'
-        '<p>Registros no filtro</p></div>',
+        f'<div class="metric-card"><h4>🚨 {metrica_label}</h4>'
+        f'<h2 style="color:#d9534f; margin:0;">{formatar_inteiro(valor_principal)}</h2>'
+        f'<p>{subtitulo_principal}</p></div>',
         unsafe_allow_html=True,
     )
 with c2:
     st.markdown(
-        f'<div class="metric-card"><h4>👥 Vitimas</h4>'
-        f'<h2 style="color:#1c2d42; margin:0;">{formatar_inteiro(total_vitimas)}</h2>'
-        '<p>Quando informado pela fonte</p></div>',
+        f'<div class="metric-card"><h4>👥 {titulo_card_secundario}</h4>'
+        f'<h2 style="color:#1c2d42; margin:0;">{formatar_inteiro(valor_card_secundario)}</h2>'
+        f'<p>{nota_secundaria}</p></div>',
         unsafe_allow_html=True,
     )
 with c3:
-    valor_vitima_mun = total_vitimas_mun if total_vitimas_mun > 0 else registros
-    label_vitima_mun = "Vitimas municipio" if total_vitimas_mun > 0 else "Linhas retornadas"
+    valor_controle = total_vitimas_mun if total_vitimas_mun > 0 else registros
+    label_controle = "Vitimas municipio" if total_vitimas_mun > 0 else "Linhas retornadas"
     st.markdown(
-        f'<div class="metric-card"><h4>📋 {label_vitima_mun}</h4>'
-        f'<h2 style="color:#f0ad4e; margin:0;">{formatar_inteiro(valor_vitima_mun)}</h2>'
+        f'<div class="metric-card"><h4>📋 {label_controle}</h4>'
+        f'<h2 style="color:#f0ad4e; margin:0;">{formatar_inteiro(valor_controle)}</h2>'
         '<p>Controle da consulta</p></div>',
         unsafe_allow_html=True,
     )
@@ -814,6 +1182,12 @@ with c4:
         f'<h3 style="color:#1c2d42; margin:0;">{localidade}</h3>'
         f'<p>{ano_sel} | {mes_nome}</p></div>',
         unsafe_allow_html=True,
+    )
+
+if usa_oficial_municipios:
+    st.info(
+        "Leitura metodologica: na base oficial municipal do MJSP/SINESP, a metrica principal e vitimas. "
+        "Por isso, os graficos e o card principal usam VITIMAS, nao OCORRENCIAS."
     )
 
 st.caption(
@@ -833,14 +1207,14 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     col_a, col_b = st.columns(2)
     with col_a:
-        st.write(f"**Evolucao mensal - {ano_sel}**")
-        plotar_serie_mensal(df_consulta)
+        st.write(f"**Evolucao mensal - {ano_sel} ({metrica_label})**")
+        plotar_serie_mensal(df_consulta, metrica_coluna, metrica_label)
     with col_b:
-        st.write("**Distribuicao por indicador/tipo de crime**")
-        plotar_crimes(df_consulta)
+        st.write(f"**Distribuicao por indicador/tipo de crime ({metrica_label})**")
+        plotar_crimes(df_consulta, metrica_coluna, metrica_label)
 
-    st.write("**Ranking municipal - top 15**")
-    plotar_top_municipios(df_consulta)
+    st.write(f"**Ranking municipal - top 15 ({metrica_label})**")
+    plotar_top_municipios(df_consulta, metrica_coluna, metrica_label)
 
 with tab2:
     colunas_preferenciais = [
@@ -860,6 +1234,16 @@ with tab3:
     else:
         st.write("**Metadados da base oficial:**")
         st.json(meta_oficial)
+        st.write("**Diagnostico das etapas do filtro:**")
+        diag_ok = diagnosticar_etapas_filtro(
+            base_oficial,
+            uf=uf_sel,
+            municipio=municipio_param,
+            crime=crime_param,
+            ano=ano_sel,
+            mes_num=mes_param,
+        )
+        st.dataframe(pd.DataFrame(diag_ok["etapas"]), width="stretch")
     st.write("**Colunas finais:**")
     st.code("\n".join(df_consulta.columns.astype(str).tolist()))
     st.write("**Amostra da consulta:**")
@@ -879,7 +1263,7 @@ with tab4:
     st.markdown(
         """
         **Observacao metodologica:** os dados oficiais do MJSP/SINESP dependem da alimentacao,
-        validacao e consolidacao feita pelos estados e pelo Distrito Federal. Valores podem mudar
-        quando a base oficial e atualizada.
+        validacao e consolidacao feita pelos estados e pelo Distrito Federal. Na base municipal,
+        a unidade principal e vitimas. Valores podem mudar quando a base oficial e atualizada.
         """
     )
